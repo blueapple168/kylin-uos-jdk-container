@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.4
 # Kylin Server V11 Minimal + Adoptium Temurin JDK 25  ——  x86_64 / arm64 统一构建
-# 注意：本变体基础镜像为 Kylin V11（microdnf），与 UOS 变体不共用基础镜像。
+# 注意：本变体基础镜像为 Kylin V11 Minimal，包管理器与 UOS 变体不同，
+# 因此 RUN 内按 microdnf -> dnf -> yum 顺序探测，不写死单一命令。
 
 # 基础镜像：Kylin Server V11 Minimal
 ARG BASE_IMAGE_TAG=v11-2503
@@ -53,12 +54,37 @@ RUN set -euxo pipefail; \
     echo "==> TARGETARCH=${TARGETARCH}  TEMURIN_ARCH=${TEMURIN_ARCH}"; \
     \
     # ---- 1. 安装软件包 ----
-    microdnf install -y \
-        shadow \
-        ca-certificates \
-        tar \
+    # 不写死单一包管理器。kylin 官方称 minimal 镜像用 microdnf，但实测
+    # v11-2503 里执行 microdnf 报 command not found（exit 127），可能是 PATH
+    # 或软链差异；platform/init 类镜像则用 yum / dnf。这里按优先级探测，
+    # 同时查 PATH 与常见绝对路径，避免依赖镜像具体形态。
+    PKG_MGR=""; \
+    for m in microdnf dnf yum; do \
+        if command -v "$m" >/dev/null 2>&1; then PKG_MGR="$(command -v "$m")"; break; fi; \
+        for d in /usr/bin /bin /usr/sbin /sbin; do \
+            if [ -x "${d}/${m}" ]; then PKG_MGR="${d}/${m}"; break 2; fi; \
+        done; \
+    done; \
+    if [ -z "$PKG_MGR" ]; then \
+        echo "ERROR: 未找到可用的包管理器 (microdnf/dnf/yum)" >&2; exit 1; \
+    fi; \
+    echo "==> 使用包管理器: ${PKG_MGR}"; \
+    # 显式安装后续步骤真正依赖的命令所属包：minimal 镜像的精简度不明，
+    # 缺 coreutils/gzip/shadow-utils/chkconfig 会在 RUN 中段以 127 失败，
+    # 而报错位置离真实原因很远，很难定位。ca-certificates 缺了则 curl 直接报 SSL 错误。
+    "$PKG_MGR" install -y \
+        coreutils \
         gzip \
-        curl; \
+        tar \
+        curl \
+        ca-certificates \
+        sed \
+        gawk \
+        grep \
+        findutils \
+        shadow-utils \
+        chkconfig \
+        glibc-langpack-zh; \
     \
     # ---- 2. 下载并解压 Temurin JDK ----
     mkdir -p /usr/lib/jvm "${OTEL_HOME}" /app; \
@@ -77,10 +103,11 @@ RUN set -euxo pipefail; \
     ln -sfn "/usr/lib/jvm/${JDK_DIR}" /usr/lib/jvm/java; \
     \
     # ---- 3. 设置默认 Java ----
-    update-alternatives --install /usr/bin/java  java  /usr/lib/jvm/java/bin/java  1000; \
-    update-alternatives --install /usr/bin/javac javac /usr/lib/jvm/java/bin/javac 1000; \
-    update-alternatives --install /usr/bin/jar   jar   /usr/lib/jvm/java/bin/jar   1000; \
-    update-alternatives --install /usr/bin/jps   jps   /usr/lib/jvm/java/bin/jps   1000; \
+    # minimal 镜像不含 chkconfig(chkconfig 包)，update-alternatives 依赖它建链接，
+    # 缺失会被绕过后 /usr/bin/java 不存在，直到 java -version 自检才报错
+    for b in java javac jar jps; do \
+        update-alternatives --install "/usr/bin/${b}" "${b}" "/usr/lib/jvm/java/bin/${b}" 1000; \
+    done; \
     \
     # ---- 4. 在线安装 dumb-init + gosu ----
     mkdir -p /tmp/chk "${BIN_DIR}"; \
@@ -114,7 +141,10 @@ RUN set -euxo pipefail; \
     \
     # ---- 6. 清理构建垃圾 ----
     rm -rf /tmp/chk; \
-    microdnf clean all; \
+    case "$(basename "$PKG_MGR")" in \
+        microdnf|dnf|yum) "$PKG_MGR" clean all ;; \
+        *) : ;; \
+    esac; \
     rm -rf /var/cache/yum/* \
            /var/cache/dnf/* \
            /var/cache/microdnf/* \
