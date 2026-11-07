@@ -62,8 +62,10 @@ RUN set -euxo pipefail; \
     \
     # ---- 2. 下载并解压 Temurin JDK ----
     mkdir -p /usr/lib/jvm "${OTEL_HOME}" /app; \
-    FILE_VER=$(echo "$JDKVER_RAW" | tr '+' '.'); \
-    URL_PATH=$(echo "$JDKVER_RAW" | sed 's/+/%2B/g'); \
+    # Temurin 资产名版本段用下划线拼接：25.0.5+8 -> 25.0.5_8
+    FILE_VER=$(echo "$JDKVER_RAW" | tr '+' '_'); \
+    # 下载路径的 tag 带 jdk- 前缀，且 + 需转义为 %2B：jdk-25.0.5%2B8
+    URL_PATH="jdk-$(echo "$JDKVER_RAW" | sed 's/+/%2B/g')"; \
     JDK_URL="${GH}/adoptium/temurin25-binaries/releases/download/${URL_PATH}/OpenJDK25U-jdk_${TEMURIN_ARCH}_linux_hotspot_${FILE_VER}.tar.gz"; \
     echo "Downloading: ${JDK_URL}"; \
     curl -Lf --retry 5 --retry-delay 2 --connect-timeout 15 "$JDK_URL" -o /tmp/jdk.tar.gz; \

@@ -192,12 +192,22 @@ jobs:
                         .[]
                         # 只认 GA 版（排除 -ea）
                         | select(.tag_name | test("^jdk-[0-9]+(\\.[0-9]+)*\\+[0-9]+(\\.[0-9]+)*$"))
-                        # 截到 +<build>: 25.0.5+8.1 -> 25.0.5+8。用 capture 而非 sub(..; "+\\1")，
-                        # 后者在多层转义下会把 \1 当字面量输出
                         | (.tag_name | ltrimstr("jdk-"))
                         | capture("^(?<v>[0-9]+(?:\\.[0-9]+)*\\+[0-9]+)")
                         | .v as $raw
-                        | { raw: $raw, ver: ([$raw | scan("[0-9]+") | tonumber]) }
+                        | {
+                            raw: $raw,
+                            # 版本段必须补齐到 MAJOR.MINOR.PATCH 再比，否则会出现
+                            # jdk-25+36（主版本 GA，[25,36]）排序大于 jdk-25.0.5+8
+                            # （[25,0,5,8]）的错误结果 —— 缺段补 0 后 25+36 变成
+                            # [25,0,0,36]，就小于 [25,0,5,8]，符合语义化版本语义
+                            ver: (
+                              ($raw | split("+")[0] | split(".") | map(tonumber)) as $main
+                              | ($main | length) as $n
+                              | $main + ([0, 0, 0][$n:])
+                              + [($raw | split("+")[1] | tonumber)]
+                            )
+                          }
                       ]
                       | sort_by(.ver) | last
                       | if . == null then empty else .raw end
