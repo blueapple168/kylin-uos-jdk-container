@@ -1,0 +1,535 @@
+name: JDK UOS 双架构镜像构建
+
+# 仓库结构 <jdk版本目录>/{Dockerfile*, docker-entrypoint.sh}，每个 Dockerfile 靠
+# buildx 内置 TARGETARCH 判别架构，一次构建同时产出 linux/amd64 与 linux/arm64。
+#
+# 两个 job:
+#   detect     : 算出待构建变体矩阵（diff 模式看文件变更，upstream 模式看上游版本）
+#   build-push : 构建并推送双架构 manifest 到 ghcr.io
+#
+# 上游 JDK 版本跟踪（schedule / check_upstream=true）：
+#   - Dragonwell 8/17/21/25，每个仓库有 standard 与 extended 两条产品线，
+#     版本号互不相同，按 <仓库>:<产品线> 分别跟踪 -> ARG DRAGONWELL_RAW
+#   - Adoptium Temurin 25，只认 GA 版（排除 -ea）-> ARG JDKVER_RAW
+#   有新版时自动改 ARG、提交回 main，并只重建确实落后的变体。
+#
+# dumb-init / gosu / otel-agent 不参与自动升级，需要时手工改对应 ARG。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "jdk*/Dockerfile*"
+      - "jdk*/docker-entrypoint.sh"
+      - "build.sh"
+      - ".github/workflows/docker-build-jdk-uos.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "jdk*/Dockerfile*"
+      - "jdk*/docker-entrypoint.sh"
+      # PR 不监听 workflow 自身: fork PR 的 GITHUB_TOKEN 无写权限，仅改 workflow 会空转
+  schedule:
+    # 每日 UTC 02:00（北京 10:00）检查上游 JDK 新版本
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "要构建的变体 (如 jdk17 / jdk25-adoptium; 留空则构建仓库中所有变体)"
+        required: false
+        default: ""
+      check_upstream:
+        description: "检查 Dragonwell 8/17/21/25 与 Adoptium Temurin 25 的最新 GA 版, 有新版则自动升级并重建受影响变体"
+        required: false
+        default: false
+        type: boolean
+env:
+  REGISTRY: ghcr.io
+  # 前提: GHCR 上已存在对应架构的基础镜像 ghcr.io/blueapple168/uos-server-20-1070a
+  PLATFORMS: linux/amd64,linux/arm64
+concurrency:
+  group: jdk-uos-${{ github.ref }}
+  cancel-in-progress: true
+# detect 需写权限提交版本升级 commit；build-push 需 packages:write 推镜像
+permissions:
+  contents: read
+jobs:
+  # 两种模式: diff（按文件变更）/ upstream（按上游 JDK 版本）
+  # 输出 matrix: [{variant, dir, dockerfile, tag, dumb_init_ver, gosu_ver, otel_ver}]
+  detect:
+    name: 检测待构建变体
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # 需写权限提交 ARG 升级 commit（GITHUB_TOKEN 的 push 不触发新 run）
+      contents: write
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 计算待构建矩阵
+        id: set
+        env:
+          WANT_VARIANT: ${{ github.event.inputs.variant }}
+          # 必须带 token: 未认证 API 限额 60 次/小时，本流程每次查 5 个仓库，极易被限流
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          mode="diff"
+          case "${{ github.event_name }}" in
+            schedule) mode="upstream" ;;
+            workflow_dispatch)
+              if [ "${{ inputs.check_upstream }}" = "true" ]; then
+                mode="upstream"
+              fi
+              ;;
+          esac
+          # 经 env 传入，不内插进 shell，避免注入
+          WANT_VARIANT="${WANT_VARIANT:-}"
+          echo "mode=${mode}" >> "$GITHUB_STEP_SUMMARY" || true
+          echo "WANT_VARIANT=${WANT_VARIANT}" >> "$GITHUB_STEP_SUMMARY" || true
+
+          # 变体注册表，与 build.sh 的 ALL_VARIANTS 对应:
+          #   目录|Dockerfile|镜像tag|变体短名|跟踪源
+          #   tag 兼作去重 key；跟踪源为空表示不参与自动升级，格式:
+          #     dragonwell:<仓库>:<产品线>   如 dragonwell17:standard（standard/extended 版本不同）
+          #     temurin:<主版本>             如 temurin:25 -> adoptium/temurin25-binaries
+          VARIANTS=(
+            "jdk8|Dockerfile|jdk8|openjdk|"
+            "jdk8|Dockerfile-dragonwell-extended|jdk8-dragonwell|dragonwell|dragonwell:dragonwell8:extended"
+            "jdk17|Dockerfile|jdk17|openjdk|"
+            "jdk17|Dockerfile-dragonwell-standard|jdk17-dragonwell|dragonwell|dragonwell:dragonwell17:standard"
+            "jdk17-ffmpeg|Dockerfile|jdk17-ffmpeg|ffmpeg|"
+            "jdk21|Dockerfile|jdk21-dragonwell|dragonwell|dragonwell:dragonwell21:standard"
+            "jdk25-lts|Dockerfile|jdk25-dragonwell|dragonwell|dragonwell:dragonwell25:standard"
+            "jdk25-lts|Dockerfile-dragonwell-extended|jdk25-dragonwell-extended|dragonwell|dragonwell:dragonwell25:extended"
+            "jdk25-lts|Dockerfile-adoptium|jdk25-adoptium|adoptium|temurin:25"
+            "jdk25-lts|Dockerfile-adoptium-kylinv11|jdk25-adoptium-kylin|kylin|temurin:25"
+          )
+
+          # 提取 ARG 默认值并去掉两侧引号。必须去引号: Dockerfile 里带引号，
+          # 而 release 解析出的版本不带，不 strip 会导致"永远不相等"→ 每次全量重建
+          get_arg() {
+            local file="$1" name="$2"
+            sed -nE "s/^ARG[[:space:]]+${name}=([^ #]+).*/\\1/p" "$file" \
+              | head -n1 \
+              | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/'
+          }
+
+          # 替换 ARG 值，保留原有引号风格与行内注释
+          set_arg() {
+            local file="$1" name="$2" val="$3"
+            local cur quoted
+            cur="$(sed -nE "s/^ARG[[:space:]]+${name}=([^ #]+).*/\\1/p" "$file" | head -n1)"
+            quoted="$val"
+            case "$cur" in
+              \"*\") quoted="\"${val}\"" ;;
+              \'*\') quoted="'${val}'" ;;
+            esac
+            # 值可能含 +（如 17.0.20.0.21+8），故用 | 作 sed 分隔符
+            sed -i -E "s|^(ARG[[:space:]]+${name}=)[^ #]+|\1${quoted}|" "$file"
+          }
+
+          matrix_arr=()
+          should_commit="no"
+          UPSTREAM_IMAGES=""
+
+          if [ "$mode" = "upstream" ]; then
+            # 上游 JDK 版本跟踪: 有新稳定版时 改写 ARG -> 提交 commit -> 只重建受影响变体
+
+            # 查 GitHub releases，返回已过滤 draft/prerelease 的 JSON 数组
+            gh_releases() {
+              local repo="$1"
+              local -a auth=()
+              if [ -n "${GH_API_TOKEN:-}" ]; then
+                auth=(-H "Authorization: Bearer ${GH_API_TOKEN}")
+              fi
+              # -f: HTTP 错误(如 403) 直接失败；auth 为空时须写 ${auth[@]+...}，否则 set -u 报错
+              curl --max-time 30 --retry 3 -fsSL \
+                -H 'Accept: application/vnd.github+json' \
+                ${auth[@]+"${auth[@]}"} \
+                "https://api.github.com/repos/${repo}/releases?page=1&per_page=100" \
+              | jq -c '[ .[] | select(.draft == false and .prerelease == false) ]' 2>/dev/null
+            }
+
+            # 解析跟踪源，输出与 Dockerfile ARG 写法一致的最新版本值
+            #   dragonwell: tag=dragonwell-standard-17.0.20.0.21+8_jdk-17.0.20-ga -> 17.0.20.0.21+8
+            #               tag=dragonwell-extended-8.30.29_jdk8u502-ga           -> 8.30.29
+            #   temurin   : tag=jdk-25.0.5+8 / jdk-25.0.5+8.1 -> 25.0.5+8
+            upstream_latest() {
+              local src="$1" provider rest repo json
+              provider="${src%%:*}"
+              rest="${src#*:}"
+
+              case "$provider" in
+                dragonwell)
+                  repo="dragonwell-project/${rest%%:*}"
+                  local line="${rest##*:}"
+                  json="$(gh_releases "$repo")"
+                  [ -n "$json" ] || return 0
+                  printf '%s' "$json" | jq -r --arg pre "dragonwell-${line}-" '
+                      [
+                        .[]
+                        | select(.tag_name | startswith($pre))
+                        # 去掉前缀与 _jdk...-ga 后缀
+                        | (.tag_name | ltrimstr($pre) | sub("_jdk.*$"; ""))
+                        # 按数字序列排序，否则 17.0.9 会排在 17.0.20 之后
+                        | { raw: ., ver: ([scan("[0-9]+") | tonumber]) }
+                      ]
+                      | sort_by(.ver) | last
+                      | if . == null then empty else .raw end
+                    ' 2>/dev/null
+                  ;;
+                temurin)
+                  repo="adoptium/temurin${rest}-binaries"
+                  json="$(gh_releases "$repo")"
+                  [ -n "$json" ] || return 0
+                  printf '%s' "$json" | jq -r '
+                      [
+                        .[]
+                        # 只认 GA 版（排除 -ea）
+                        | select(.tag_name | test("^jdk-[0-9]+(\\.[0-9]+)*\\+[0-9]+(\\.[0-9]+)*$"))
+                        # 截到 +<build>: 25.0.5+8.1 -> 25.0.5+8。用 capture 而非 sub(..; "+\\1")，
+                        # 后者在多层转义下会把 \1 当字面量输出
+                        | (.tag_name | ltrimstr("jdk-"))
+                        | capture("^(?<v>[0-9]+(?:\\.[0-9]+)*\\+[0-9]+)")
+                        | .v as $raw
+                        | { raw: $raw, ver: ([$raw | scan("[0-9]+") | tonumber]) }
+                      ]
+                      | sort_by(.ver) | last
+                      | if . == null then empty else .raw end
+                    ' 2>/dev/null
+                  ;;
+                *)
+                  echo "::warning::未知的跟踪源类型: ${provider}" >&2
+                  ;;
+              esac
+            }
+
+            # 跟踪源 -> ARG 名
+            upstream_arg_name() {
+              case "${1%%:*}" in
+                dragonwell) printf 'DRAGONWELL_RAW' ;;
+                temurin)    printf 'JDKVER_RAW' ;;
+                *)          printf '' ;;
+              esac
+            }
+
+            # 一次取齐所有跟踪源的最新版本。用平铺表而非关联数组:
+            # $( ) 子 shell 内给数组赋值不会回传，会拿到空值
+            DW_TABLE=""
+            DW_FAILED=""
+            for v in "${VARIANTS[@]}"; do
+              IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+              [ -n "$dwsrc" ] || continue
+              if printf '%s' "$DW_TABLE" | grep -qF "${dwsrc}="; then
+                continue
+              fi
+              dw_val="$(upstream_latest "$dwsrc" || true)"
+              if [ -n "$dw_val" ]; then
+                DW_TABLE="${DW_TABLE}${dwsrc}=${dw_val}"$'\n'
+              else
+                DW_FAILED="${DW_FAILED} ${dwsrc}"
+                echo "::warning::未能取到 ${dwsrc} 的最新版本 (可能被 GitHub API 限流)"
+              fi
+            done
+
+            # 取某跟踪源版本，取不到输出空串
+            dw_get() {
+              local src="$1" line
+              line="$(printf '%s' "$DW_TABLE" | grep -F "${src}=" | head -n1)"
+              printf '%s' "${line#*=}"
+            }
+
+            # 判定哪些变体落后
+            stale_files=""
+            stale_rows=""
+            for v in "${VARIANTS[@]}"; do
+              IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+              [ -n "$dwsrc" ] || continue
+              f="${dir}/${df}"
+              [ -f "$f" ] || continue
+
+              jdk_arg="$(upstream_arg_name "$dwsrc")"
+              if [ -z "$jdk_arg" ]; then
+                echo "::warning::${f}: 跟踪源 ${dwsrc} 无对应 ARG, 跳过"
+                continue
+              fi
+              f_dw="$(get_arg "$f" "$jdk_arg")"
+              dw_new="$(dw_get "$dwsrc")"
+              if [ -z "$dw_new" ]; then
+                echo "::warning::${f}: 未能取到 ${dwsrc} 的最新版本, 跳过判定"
+                continue
+              fi
+              if [ "$f_dw" != "$dw_new" ]; then
+                stale_files="${stale_files}${f}"$'\n'
+                stale_rows="${stale_rows}| \`${tag}\` | \`${f}\` | ${dwsrc} | ${f_dw} → **${dw_new}** |"$'\n'
+              fi
+            done
+
+            {
+              echo "### 上游 JDK 版本跟踪 (Dragonwell / Adoptium Temurin)"
+              echo ""
+              echo "| 变体 | 跟踪源 | ARG | 当前 | 上游最新 |"
+              echo "|---|---|---|---|---|"
+              for v in "${VARIANTS[@]}"; do
+                IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+                [ -n "$dwsrc" ] || continue
+                [ -f "${dir}/${df}" ] || continue
+                cur_arg="$(upstream_arg_name "$dwsrc")"
+                cur_dw="$(get_arg "${dir}/${df}" "$cur_arg")"
+                new_dw="$(dw_get "$dwsrc")"
+                echo "| \`${tag}\` | ${dwsrc} | \`${cur_arg}\` | ${cur_dw} | ${new_dw:-取不到} |"
+              done
+              echo ""
+              if [ -n "$stale_files" ]; then
+                echo "### 待升级 (将重建以下变体)"
+                echo ""
+                echo "| 变体 | 文件 | 跟踪源 | 版本变化 |"
+                echo "|---|---|---|---|"
+                printf '%s' "$stale_rows"
+              elif [ -n "$DW_FAILED" ]; then
+                # 有源取不到时不能报"已是最新"，否则限流会伪装成"无更新"而漏版本
+                echo "### ⚠️ 部分跟踪源查询失败，本次结果不完整"
+                echo ""
+                echo "失败的跟踪源: \`${DW_FAILED# }\`"
+                echo ""
+                echo "常见原因: GitHub API 未认证/限流。请确认 workflow 已传 GITHUB_TOKEN，或稍后手动重跑。"
+              else
+                echo "所有参与跟踪的变体均已是最新稳定版，无需构建。"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY" || true
+
+            # 全部源失败则让 job 失败，否则定时任务会长期"静默成功"却漏掉新版本
+            dw_total=0
+            for v in "${VARIANTS[@]}"; do
+              IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+              [ -n "$dwsrc" ] || continue
+              dw_total=$((dw_total + 1))
+            done
+            dw_ok="$(printf '%s' "$DW_TABLE" | grep -c '=' || true)"
+            if [ "$dw_total" -gt 0 ] && [ "$dw_ok" -eq 0 ]; then
+              echo "::error::所有上游 JDK 跟踪源均查询失败, 请检查 GitHub API 访问或 token 配置"
+              exit 1
+            fi
+
+            if [ -n "$stale_files" ]; then
+              echo "::notice::检测到上游 JDK 新版本，准备升级并构建受影响变体"
+
+              # 逐变体按各自跟踪源回填（standard 与 extended 版本号不同）
+              while IFS= read -r f; do
+                [ -n "$f" ] || continue
+                for v in "${VARIANTS[@]}"; do
+                  IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+                  [ "${dir}/${df}" = "$f" ] || continue
+                  [ -n "$dwsrc" ] || continue
+                  arg_name="$(upstream_arg_name "$dwsrc")"
+                  new_val="$(dw_get "$dwsrc")"
+                  if [ -n "$arg_name" ] && [ -n "$new_val" ]; then
+                    set_arg "$f" "$arg_name" "$new_val"
+                  fi
+                  break
+                done
+              done <<< "$stale_files"
+
+              should_commit="yes"
+
+              # 只把受影响变体入矩阵
+              for v in "${VARIANTS[@]}"; do
+                IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+                f="${dir}/${df}"
+                [ -f "$f" ] || continue
+                in_stale=0
+                if printf '%s' "$stale_files" | grep -qxF "$f"; then in_stale=1; fi
+                if [ "$in_stale" = "1" ]; then
+                  matrix_arr+=("{\"variant\":\"${f}\",\"dir\":\"${dir}\",\"dockerfile\":\"${df}\",\"tag\":\"${tag}\",\"dumb_init_ver\":\"$(get_arg "$f" DUMB_INIT_VER)\",\"gosu_ver\":\"$(get_arg "$f" GOSU_VER)\",\"otel_ver\":\"$(get_arg "$f" OTEL_AGENT_VER)\"}")
+                fi
+              done
+              UPSTREAM_IMAGES="built"
+            else
+              echo "::notice::参与跟踪的变体均为最新稳定版，无需构建"
+            fi
+
+          else
+            # 变更检测模式: 由本次提交涉及的文件决定
+            files=""
+            case "${{ github.event_name }}" in
+              pull_request)
+                git fetch origin "${{ github.base_ref }}"
+                files=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" || true)
+                ;;
+              push)
+                files=$(git diff --name-only "${{ github.event.before }}" HEAD || true)
+                ;;
+            esac
+
+            # 取不到 diff（手动触发 / 新建分支首推 / 重跑）时的兜底
+            if [ -z "$files" ] && [ -n "${WANT_VARIANT}" ]; then
+              files="${WANT_VARIANT}/Dockerfile"
+            fi
+
+            # 命中优先级: 精确命中本变体 Dockerfile -> 只构建该变体；
+            # 同目录 .sh 变更 -> 该目录全部变体；都不匹配 -> 全量回退。
+            # 不能用 "^${dir}/(Dockerfile|${df})$" 宽匹配，否则改 jdk17/Dockerfile
+            # 会连带重建 jdk17/Dockerfile-dragonwell-*
+            hit_tags=""
+            if [ -n "$files" ]; then
+              while IFS= read -r v; do
+                IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+                [ -f "${dir}/${df}" ] || continue
+                if printf '%s\n' "$files" | grep -qxF "${dir}/${df}"; then
+                  hit_tags="${hit_tags} ${tag}"
+                  continue
+                fi
+                if printf '%s\n' "$files" | grep -qE "^${dir}/[^/]+\.sh$"; then
+                  hit_tags="${hit_tags} ${tag}"
+                fi
+              done < <(printf '%s\n' "${VARIANTS[@]}")
+            fi
+
+            # 手工指定 variant 时按目录名 / tag 全量命中
+            if [ -z "$(echo "$hit_tags" | tr -d ' ')" ] && [ -n "${WANT_VARIANT}" ]; then
+              while IFS= read -r v; do
+                IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+                [ -f "${dir}/${df}" ] || continue
+                if [ "${dir}" = "${WANT_VARIANT}" ] || [ "${tag}" = "${WANT_VARIANT}" ]; then
+                  hit_tags="${hit_tags} ${tag}"
+                fi
+              done < <(printf '%s\n' "${VARIANTS[@]}")
+            fi
+
+            # 仍无命中则全量
+            if [ -z "$(echo "$hit_tags" | tr -d ' ')" ]; then
+              echo "::notice::未匹配到具体变体，回退为全量构建"
+              hit_tags="$(printf '%s\n' "${VARIANTS[@]}" | awk -F'|' '{print $3}' | tr '\n' ' ')"
+            fi
+
+            for v in "${VARIANTS[@]}"; do
+              IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+              [ -f "${dir}/${df}" ] || continue
+              case " ${hit_tags} " in
+                *" ${tag} "*)
+                  cur="$(get_arg "${dir}/${df}" OTEL_AGENT_VER)"
+                  test -n "$cur" || echo "::warning::${dir}/${df} 缺少 OTEL_AGENT_VER"
+                  matrix_arr+=("{\"variant\":\"${dir}/${df}\",\"dir\":\"${dir}\",\"dockerfile\":\"${df}\",\"tag\":\"${tag}\",\"dumb_init_ver\":\"$(get_arg "${dir}/${df}" DUMB_INIT_VER)\",\"gosu_ver\":\"$(get_arg "${dir}/${df}" GOSU_VER)\",\"otel_ver\":\"${cur}\"}")
+                  ;;
+              esac
+            done
+          fi
+
+          # 生成最终矩阵
+          matrix="[$(IFS=,; echo "${matrix_arr[*]}")]"
+
+          # 提交版本升级（仅上游模式）
+          if [ "$mode" = "upstream" ] && [ "$should_commit" = "yes" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -u
+            if git diff --cached --quiet; then
+              echo "::warning::版本号已更新但没有可提交的变更"
+            else
+              git commit -m "chore(bump): 升级上游组件与 Dragonwell 版本 (由定时任务自动检测)"
+              if git push; then
+                echo "已提交版本升级 commit 到 main"
+              else
+                # 推送失败不阻断构建，本次仍用新版本号
+                echo "::warning::版本升级 commit 推送失败 (可能因分支保护)，本次构建继续使用检测到的新版本号"
+              fi
+            fi
+          fi
+
+          if [ "$matrix" = "[]" ]; then
+            echo "::notice::没有需要构建的变体，跳过"
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "待构建矩阵: ${matrix}" >> "$GITHUB_STEP_SUMMARY"
+
+  # 构建并推送双架构 manifest
+  build-push:
+    name: "推送镜像 (${{ matrix.tag }})"
+    needs: [detect]
+    # PR 只跑 detect；矩阵为空时不能进入（空 include 会被判定为无构建向量）
+    if: >-
+      always() &&
+      needs.detect.outputs.matrix != '[]' &&
+      needs.detect.outputs.matrix != '' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'schedule')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect.outputs.matrix || '[]') }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILD_DIR: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 QEMU (仅多架构时需要)
+        if: contains(env.PLATFORMS, 'arm')
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像名称与 tag
+        id: meta
+        run: |
+          set -eux
+          TAG_NAME="${{ matrix.tag }}"
+          test -n "$TAG_NAME"
+          REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${REGISTRY}/${REPO}"
+          VERSION_SUFFIX="${TAG_NAME#jdk}"   # 用于 cache scope
+          {
+            echo "image=${IMAGE}"
+            echo "tags=${IMAGE}:${TAG_NAME},${IMAGE}:${TAG_NAME}-${GITHUB_SHA::7}"
+            echo "scope=${VERSION_SUFFIX}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 构建并推送 (amd64 + arm64 合并 manifest)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BUILD_DIR }}
+          file: ${{ env.BUILD_DIR }}/${{ matrix.dockerfile }}
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          # 组件版本经 build-arg 传入，取自矩阵（即 Dockerfile 当前 ARG 值）
+          build-args: |
+            DUMB_INIT_VER=${{ matrix.dumb_init_ver }}
+            GOSU_VER=${{ matrix.gosu_ver }}
+            OTEL_AGENT_VER=${{ matrix.otel_ver }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=jdk-${{ steps.meta.outputs.scope }}
+          cache-to: type=gha,scope=jdk-${{ steps.meta.outputs.scope }},mode=max
+
+      - name: 校验 manifest 包含两个架构
+        run: |
+          set -eux
+          docker buildx imagetools inspect \
+            "${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]'):${{ matrix.tag }}"
+          {
+            echo "### 已推送镜像 (${{ matrix.variant }})"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
