@@ -1,0 +1,67 @@
+name: 诊断 Kylin 基础镜像内容
+
+# 一次性诊断用：打印 cr.kylinos.cn 上 Kylin 基础镜像里实际存在哪些命令与包管理器。
+# 输出通过 job summary 回传，不需要下载日志。
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "要探测的镜像（repo:tag）"
+        required: false
+        default: "cr.kylinos.cn/kylin/kylin-server-minimal:v11-2503"
+
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 探测镜像内容
+        run: |
+          set -u
+          IMAGE="${{ github.event.inputs.image }}"
+          IMAGE="${IMAGE:-cr.kylinos.cn/kylin/kylin-server-minimal:v11-2503}"
+          OUT="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## 探测 $IMAGE on ${{ matrix.platform }}"
+          } >> "$OUT"
+
+          docker run --rm --platform "${{ matrix.platform }}" \
+            --entrypoint sh "$IMAGE" -c '
+              echo "=== uname ==="; uname -a 2>&1 || true
+              echo "=== os-release ==="; cat /etc/os-release 2>&1 || true
+              echo "=== PATH ==="; echo "$PATH"
+              echo "=== 包管理器 ==="
+              for m in microdnf dnf yum rpm tdnf apk zypper; do
+                if command -v "$m" >/dev/null 2>&1; then
+                  echo "FOUND $m -> $(command -v $m)"
+                else
+                  echo "MISSING $m"
+                fi
+              done
+              echo "=== 关键命令 ==="
+              for c in sh bash ls cat tar gzip curl wget sed awk grep install ln mkdir rm cp mv chmod chown sha256sum tr basename update-alternatives useradd groupadd chkconfig locale; do
+                if command -v "$c" >/dev/null 2>&1; then
+                  echo "FOUND $c -> $(command -v $c)"
+                else
+                  echo "MISSING $c"
+                fi
+              done
+              echo "=== /usr/bin 列表 ==="; ls -1 /usr/bin 2>&1 || true
+              echo "=== / 根目录 ==="; ls -la / 2>&1 || true
+            ' > "/tmp/diag-${{ matrix.platform }}.txt" 2>&1 || true
+
+          {
+            echo '```'
+            cat "/tmp/diag-${{ matrix.platform }}.txt"
+            echo '```'
+          } >> "$OUT"
