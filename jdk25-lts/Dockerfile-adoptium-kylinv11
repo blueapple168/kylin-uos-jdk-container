@@ -11,6 +11,10 @@ FROM ${BASE_IMAGE_REPO}:${BASE_IMAGE_TAG}
 ARG BASE_IMAGE_TAG
 ARG BASE_IMAGE_REPO
 
+# buildx 自动注入的目标架构（amd64 / arm64）。必须声明才能引用，
+# 否则 set -u 下引用未定义的 TARGETARCH 会报 unbound variable
+ARG TARGETARCH
+
 # JDKVER_RAW 写法 <版本号>+<build号>。下载链路由此推导：文件名把 + 换成 .，URL 路径把 + 转义为 %2B。
 ARG JDKVER_RAW="25.0.5+8"
 

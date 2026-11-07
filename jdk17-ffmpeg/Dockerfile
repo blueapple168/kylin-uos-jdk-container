@@ -9,6 +9,10 @@ FROM ${BASE_IMAGE_REPO}/${BASE_IMAGE_TAG}
 ARG BASE_IMAGE_TAG
 ARG BASE_IMAGE_REPO
 
+# buildx 自动注入的目标架构（amd64 / arm64）。必须声明才能引用，
+# 否则 set -u 下引用未定义的 TARGETARCH 会报 unbound variable
+ARG TARGETARCH
+
 # 组件版本，均从 GitHub 官方 release 下载并做 sha256 校验；
 # 内网可用 MIRROR_GITHUB 指向代理，如 --build-arg MIRROR_GITHUB=https://ghproxy.example.com/https://github.com
 ARG DUMB_INIT_VER=1.2.5
