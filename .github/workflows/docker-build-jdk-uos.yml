@@ -373,7 +373,7 @@ jobs:
                 in_stale=0
                 if printf '%s' "$stale_files" | grep -qxF "$f"; then in_stale=1; fi
                 if [ "$in_stale" = "1" ]; then
-                  matrix_arr+=("{\"variant\":\"${f}\",\"dir\":\"${dir}\",\"dockerfile\":\"${df}\",\"tag\":\"${tag}\",\"tag_new\":\"$(make_tag "$dir" "$df" "$v_os" "$v_osver" "$v_vendor" "$v_flavor")\",\"dumb_init_ver\":\"$(get_arg "$f" DUMB_INIT_VER)\",\"gosu_ver\":\"$(get_arg "$f" GOSU_VER)\",\"otel_ver\":\"$(get_arg "$f" OTEL_AGENT_VER)\"}")
+                  matrix_arr+=("{\"variant\":\"${f}\",\"dir\":\"${dir}\",\"dockerfile\":\"${df}\",\"tag\":\"${tag}\",\"tag_new\":\"$(make_tag "$dir" "$df" "$v_os" "$v_osver" "$v_vendor" "$v_flavor")\",\"os\":\"${v_os}\",\"osver\":\"${v_osver}\",\"vendor\":\"${v_vendor}\",\"flavor\":\"${v_flavor}\",\"dumb_init_ver\":\"$(get_arg "$f" DUMB_INIT_VER)\",\"gosu_ver\":\"$(get_arg "$f" GOSU_VER)\",\"otel_ver\":\"$(get_arg "$f" OTEL_AGENT_VER)\"}")
                 fi
               done
               UPSTREAM_IMAGES="built"
@@ -442,7 +442,7 @@ jobs:
                 *" ${tag} "*)
                   cur="$(get_arg "${dir}/${df}" OTEL_AGENT_VER)"
                   test -n "$cur" || echo "::warning::${dir}/${df} 缺少 OTEL_AGENT_VER"
-                  matrix_arr+=("{\"variant\":\"${dir}/${df}\",\"dir\":\"${dir}\",\"dockerfile\":\"${df}\",\"tag\":\"${tag}\",\"tag_new\":\"$(make_tag "$dir" "$df" "$v_os" "$v_osver" "$v_vendor" "$v_flavor")\",\"dumb_init_ver\":\"$(get_arg "${dir}/${df}" DUMB_INIT_VER)\",\"gosu_ver\":\"$(get_arg "${dir}/${df}" GOSU_VER)\",\"otel_ver\":\"${cur}\"}")
+                  matrix_arr+=("{\"variant\":\"${dir}/${df}\",\"dir\":\"${dir}\",\"dockerfile\":\"${df}\",\"tag\":\"${tag}\",\"tag_new\":\"$(make_tag "$dir" "$df" "$v_os" "$v_osver" "$v_vendor" "$v_flavor")\",\"os\":\"${v_os}\",\"osver\":\"${v_osver}\",\"vendor\":\"${v_vendor}\",\"flavor\":\"${v_flavor}\",\"dumb_init_ver\":\"$(get_arg "${dir}/${df}" DUMB_INIT_VER)\",\"gosu_ver\":\"$(get_arg "${dir}/${df}" GOSU_VER)\",\"otel_ver\":\"${cur}\"}")
                   ;;
               esac
             done
