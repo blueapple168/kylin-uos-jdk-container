@@ -175,40 +175,8 @@ jobs:
             echo "::warning::镜像不存在或拉取失败: ${IMAGE} (${{ matrix.platform }})，跳过验证"
           fi
 
-      - name: 校验镜像 label
-        id: labels
-        if: steps.pull.outputs.ok == '1'
-        run: |
-          set -eux
-          IMAGE="${{ steps.pull.outputs.image }}"
-          LABELS="$(docker inspect --format '{{json .Config.Labels}}' "${IMAGE}")"
-          echo "${LABELS}" | jq .
-
-          fails=0
-          chk() {   # $1=label 键  $2=期望值
-            local got
-            got="$(echo "${LABELS}" | jq -r --arg k "$1" '.[$k] // ""')"
-            if [ "${got}" = "$2" ]; then
-              printf 'PASS\tlabel %s\t%s\n' "$1" "${got}"
-            else
-              printf 'FAIL\tlabel %s\t期望 %s，实际 %s\n' "$1" "$2" "${got:-空}"
-              fails=$((fails + 1))
-            fi
-          }
-          # 检查结果必须落盘，否则汇总步骤读不到（printf 默认只打到日志）
-          {
-            chk os          "${{ matrix.os }}"
-            chk os.version  "${{ matrix.osver }}"
-            chk jdk.vendor  "${{ matrix.vendor }}"
-            # OpenJDK 变体的版本由 UOS 仓库决定，label 写的是 repo 占位，
-            # 真实版本由 tag-check job 与规范 tag 比对
-            if [ "${{ matrix.vendor }}" != "openjdk" ]; then
-              chk jdk.version "${{ matrix.jdkver }}"
-            else
-              printf 'INFO\tlabel jdk.version\trepo（由仓库决定，见 tag-check）\n'
-            fi
-            printf 'SUMMARY\tFAIL\t%s\n' "${fails}"
-          } | tee /tmp/labels.tsv
+      # label 校验不在这里做：arm64 下 docker pull 后 inspect 常拿到空 Config，
+      # 改用 registry API 读该架构的 config blob，放在 tag-check job 里统一校验。
 
       - name: 容器内功能与版本自检
         id: selftest
@@ -313,7 +281,9 @@ jobs:
           IMAGE="${REGISTRY}/${REPO}"
           # 直接用 registry API 取 manifest digest，比 buildx inspect 的模板更稳
           GHCR_TOKEN="$(curl -fsS "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" | jq -r .token)"
-          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json"
+          # 必须同时接受 index 和单架构 manifest：查 tag 返回 index，
+          # 查子 manifest 返回单架构；少了后者会 404
+          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
           digest_of() {
             curl -fsSI -H "Authorization: Bearer ${GHCR_TOKEN}" -H "Accept: ${ACCEPT}" \
               "https://ghcr.io/v2/${REPO}/manifests/$1" \
@@ -322,6 +292,48 @@ jobs:
 
           fails=0
           rows=""
+          label_rows=""
+
+          # 直接读 registry 里该架构的 config blob 取 Labels。
+          # 不用 docker pull + inspect：arm64 下 inspect 常拿到空 Config，读不到 label。
+          config_labels() {   # $1=tag  $2=arch
+            local md cd
+            md="$(curl -fsSL -H "Authorization: Bearer ${GHCR_TOKEN}" -H "Accept: ${ACCEPT}" \
+                  "https://ghcr.io/v2/${REPO}/manifests/$1" \
+                  | jq -r --arg a "$2" '.manifests[]? | select(.platform.architecture==$a) | .digest' | head -n1)"
+            [ -n "$md" ] && [ "$md" != "null" ] || return 1
+            cd="$(curl -fsSL -H "Authorization: Bearer ${GHCR_TOKEN}" -H "Accept: ${ACCEPT}" \
+                  "https://ghcr.io/v2/${REPO}/manifests/${md}" | jq -r '.config.digest')"
+            [ -n "$cd" ] && [ "$cd" != "null" ] || return 1
+            curl -fsSL -H "Authorization: Bearer ${GHCR_TOKEN}" \
+              "https://ghcr.io/v2/${REPO}/blobs/${cd}" | jq -c '.config.Labels // {}'
+          }
+
+          check_labels() {   # $1=tag  $2=os  $3=osver  $4=vendor  $5=jdkver(可空)
+            local tag="$1" arch lb k want got pairs
+            for arch in amd64 arm64; do
+              if ! lb="$(config_labels "$tag" "$arch")"; then
+                echo "::error::${tag} ${arch}: 读不到 config blob"
+                fails=$((fails + 1))
+                label_rows="${label_rows}| \`${tag}\` | ${arch} | - | ❌ 读不到 config |"$'\n'
+                continue
+              fi
+              pairs="os=$2 os.version=$3 jdk.vendor=$4"
+              [ -n "$5" ] && pairs="${pairs} jdk.version=$5"
+              for kv in $pairs; do
+                k="${kv%%=*}"; want="${kv#*=}"
+                got="$(printf '%s' "$lb" | jq -r --arg k "$k" '.[$k] // ""')"
+                if [ "$got" = "$want" ]; then
+                  label_rows="${label_rows}| \`${tag}\` | ${arch} | ${k} | ✅ ${got} |"$'\n'
+                else
+                  echo "::error::${tag} ${arch}: label ${k} 期望 ${want}，实际 ${got:-空}"
+                  fails=$((fails + 1))
+                  label_rows="${label_rows}| \`${tag}\` | ${arch} | ${k} | ❌ 期望 ${want}，实际 ${got:-空} |"$'\n'
+                fi
+              done
+            done
+          }
+
           while IFS='|' read -r dir df tag_old short dwsrc v_os v_osver v_vendor v_flavor; do
             [ -n "$dir" ] || continue
             [ -f "${dir}/${df}" ] || continue
@@ -368,6 +380,13 @@ jobs:
               fails=$((fails + 1))
               rows="${rows}| \`${tag_old}\` | \`${expect}\` | ❌ digest 不一致 |"$'\n'
             fi
+
+            # OpenJDK 的 jdk.version label 写的是 repo 占位，不参与比对
+            if [ "$v_vendor" = "openjdk" ]; then
+              check_labels "${expect}" "$v_os" "$v_osver" "$v_vendor" ""
+            else
+              check_labels "${expect}" "$v_os" "$v_osver" "$v_vendor" "${jdkver}"
+            fi
           done < <(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt)
 
           {
@@ -376,6 +395,12 @@ jobs:
             echo "| 历史 tag | 规范 tag | 结果 |"
             echo "|---|---|---|"
             printf '%s' "$rows"
+            echo ""
+            echo "### 镜像 label 校验（读 registry config blob）"
+            echo ""
+            echo "| 规范 tag | 架构 | label | 结果 |"
+            echo "|---|---|---|---|"
+            printf '%s' "$label_rows"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$fails" -gt 0 ]; then

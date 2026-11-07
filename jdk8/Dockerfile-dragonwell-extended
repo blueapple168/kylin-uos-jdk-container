@@ -144,6 +144,7 @@ ENV PATH=$JAVA_HOME/bin:$PATH \
     CLASSPATH=.:$JAVA_HOME/lib/dt.jar:$JAVA_HOME/lib/tools.jar \
     TZ=Asia/Shanghai \
     JAVA_OPTS="-XX:+UseContainerSupport \
+               -XX:+UnlockExperimentalVMOptions \
                -XX:MaxRAMPercentage=75.0" \
     SECURERANDOM="-Djava.security.egd=file:/dev/./urandom" \
     JAVA_FILENAME_CODING="-Dsun.jnu.encoding=UTF-8 \

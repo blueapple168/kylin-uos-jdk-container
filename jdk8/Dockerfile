@@ -116,6 +116,7 @@ ENV JAVA_HOME=/usr/lib/jvm/java-1.8.0-openjdk
 ENV PATH=$JAVA_HOME/bin:$PATH \
     TZ=Asia/Shanghai \
     JAVA_OPTS="-XX:+UseContainerSupport \
+               -XX:+UnlockExperimentalVMOptions \
                -XX:MaxRAMPercentage=75.0" \
     SECURERANDOM="-Djava.security.egd=file:/dev/./urandom" \
     JAVA_FILENAME_CODING="-Dsun.jnu.encoding=UTF-8 \

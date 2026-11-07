@@ -144,7 +144,15 @@ if [ -n "${JAVA_HOME:-}" ]; then
     fi
     case "$jhome" in
         "$JAVA_HOME"|"$JAVA_HOME"/*) ok "java.home 一致性" "与 JAVA_HOME 相符" ;;
-        *)                           wn "java.home 一致性" "java.home=${jhome:-空}，JAVA_HOME=${JAVA_HOME}" ;;
+        *)
+            # JAVA_HOME 常是指向真实版本目录的符号链接（如 java-17-openjdk -> java-17-openjdk-17.0.9...x86_64），
+            # java.home 报的是解析后的真实路径，归一化后再比，否则每次都误报
+            if [ -n "$jhome" ] && [ "$(readlink -f "$JAVA_HOME" 2>/dev/null || printf '%s' "$JAVA_HOME")" = "$jhome" ]; then
+                ok "java.home 一致性" "JAVA_HOME 为符号链接，解析后与 java.home 一致"
+            else
+                wn "java.home 一致性" "java.home=${jhome:-空}，JAVA_HOME=${JAVA_HOME}"
+            fi
+            ;;
     esac
 else
     ng "JAVA_HOME" "环境变量未设置"
@@ -176,16 +184,24 @@ else
 fi
 
 # ---------- 6. JVM 容器参数 ----------
-# JAVA_OPTS 里的 -XX:MaxRAMPercentage 不会自动生效，必须显式带上才能看到实际值
-mrp="$(java ${JAVA_OPTS:-} -XX:+PrintFlagsFinal -version 2>/dev/null \
-        | sed -n 's/.*MaxRAMPercentage[[:space:]]*=[[:space:]]*\([0-9][0-9.]*\).*/\1/p' | head -n1)"
-if [ -n "$mrp" ]; then
-    case "$mrp" in
-        75|75.0|75.000000) ok "MaxRAMPercentage" "${mrp}（符合 75.0 预期）" ;;
-        *)                 wn "MaxRAMPercentage" "实际 ${mrp}，预期 75.0" ;;
-    esac
+# JAVA_OPTS 里的 -XX:MaxRAMPercentage 不会自动生效，必须显式带上才能看到实际值。
+# 顺带验证 JAVA_OPTS 本身能被这个 JDK 接受：JDK 8 的 MaxRAMPercentage 是 experimental，
+# 少了 -XX:+UnlockExperimentalVMOptions 会直接报 Unrecognized VM option 而起不来，
+# 这类问题只有真跑一遍才能发现，所以命令失败要判 FAIL 而不是记个 WARN 放过。
+if mrp_out="$(java ${JAVA_OPTS:-} -XX:+PrintFlagsFinal -version 2>&1)"; then
+    mrp="$(printf '%s\n' "$mrp_out" \
+            | sed -n 's/.*MaxRAMPercentage[[:space:]]*=[[:space:]]*\([0-9][0-9.]*\).*/\1/p' | head -n1)"
+    if [ -n "$mrp" ]; then
+        case "$mrp" in
+            75|75.0|75.000000) ok "MaxRAMPercentage" "${mrp}（符合 75.0 预期）" ;;
+            *)                 wn "MaxRAMPercentage" "实际 ${mrp}，预期 75.0" ;;
+        esac
+    else
+        wn "MaxRAMPercentage" "JAVA_OPTS 可执行但未输出该参数"
+    fi
 else
-    wn "MaxRAMPercentage" "未能从 PrintFlagsFinal 解析出该参数"
+    ng "MaxRAMPercentage" "带 JAVA_OPTS 启动 java 失败（该 JDK 可能不支持其中某个参数）"
+    printf 'INFO\tJAVA_OPTS 启动报错\t%s\n' "$(printf '%s' "$mrp_out" | head -n2 | tr '\n' ' ')"
 fi
 
 # ---------- 7. 运行时组件 ----------
