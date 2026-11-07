@@ -1,7 +1,8 @@
 name: 清理多余镜像 tag
 
-# 一次性任务：删掉 registry 上除规范 tag 外的所有 tag。
-# 只删「digest 不被任何规范 tag 引用」的 manifest，避免误删正在用的镜像。
+# 一次性任务：registry 上只保留 10 个规范 tag。
+# 用 GitHub package API 删 version，这样连「tag 被覆盖后变成 untagged」的旧版本也能清掉
+# （registry 的 tags/list 看不到 untagged，只靠 DELETE manifest 删不干净）。
 # 用完即删本文件。
 
 on:
@@ -10,15 +11,12 @@ on:
       dry_run:
         description: "只列出要删的，不真删"
         required: false
-        default: "false"
+        default: "true"
         type: boolean
 
 permissions:
   contents: read
   packages: write
-
-env:
-  REGISTRY: ghcr.io
 
 jobs:
   cleanup:
@@ -28,75 +26,83 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 删除非规范 tag
+      - name: 删除非规范 version
         env:
           DRY_RUN: ${{ inputs.dry_run }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eux
-          REPO="$(echo '${{ github.repository }}' | tr 'A-Z' 'a-z')"
-          # push scope 才能删 manifest
-          TOKEN="$(curl -fsS -u "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            "https://ghcr.io/token?scope=repository:${REPO}:pull,push&service=ghcr.io" | jq -r .token)"
-          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
+          PKG="$(echo '${{ github.repository }}' | cut -d/ -f2 | tr 'A-Z' 'a-z')"
+          OWNER="${{ github.repository_owner }}"
+          API="https://api.github.com/user/packages/container/${PKG}/versions"
 
-          digest_of() {
-            curl -fsSI -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
-              "https://ghcr.io/v2/${REPO}/manifests/$1" \
-              | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'
-          }
+          # 规范 tag：以 uos- / kylin- 开头
+          is_spec() { case "$1" in uos-*|kylin-*) return 0 ;; *) return 1 ;; esac; }
 
-          ALL_TAGS="$(curl -fsS -H "Authorization: Bearer ${TOKEN}" \
-            "https://ghcr.io/v2/${REPO}/tags/list" | jq -r '.tags[]?' | sort)"
-          echo "当前共 $(printf '%s\n' "$ALL_TAGS" | grep -c . || true) 个 tag"
+          # 拉全部 version（含 untagged），分页直到取完
+          : > /tmp/versions.jsonl
+          page=1
+          while :; do
+            chunk="$(curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${API}?per_page=100&page=${page}")"
+            n="$(printf '%s' "$chunk" | jq 'length')"
+            [ "$n" -gt 0 ] || break
+            printf '%s' "$chunk" | jq -c '.[]' >> /tmp/versions.jsonl
+            [ "$n" -lt 100 ] && break
+            page=$((page + 1))
+          done
+          echo "共 $(grep -c . /tmp/versions.jsonl || true) 个 version"
 
-          # 规范 tag 以 uos- / kylin- 开头
-          KEEP="$(printf '%s\n' "$ALL_TAGS" | grep -E '^(uos-|kylin-)' || true)"
-          DROP="$(printf '%s\n' "$ALL_TAGS" | grep -vE '^(uos-|kylin-)' || true)"
-          echo "保留 $(printf '%s\n' "$KEEP" | grep -c . || true) 个规范 tag"
-          echo "待删 $(printf '%s\n' "$DROP" | grep -c . || true) 个"
+          keep=0; deleted=0; patched=0
+          while IFS= read -r v; do
+            [ -n "$v" ] || continue
+            vid="$(printf '%s' "$v" | jq -r '.id')"
+            tags="$(printf '%s' "$v" | jq -r '[.metadata.container.tags[]?] | join(",")')"
 
-          # 规范 tag 占用的 digest，这些 manifest 绝对不能删
-          KEEP_DIGESTS=""
-          while IFS= read -r t; do
-            [ -n "$t" ] || continue
-            d="$(digest_of "$t" || true)"
-            [ -n "$d" ] && KEEP_DIGESTS="${KEEP_DIGESTS}${d}"$'\n'
-          done <<< "$KEEP"
+            # 拆出规范 tag 与待删 tag
+            spec=""; junk=""
+            IFS=',' read -ra arr <<< "$tags"
+            for t in "${arr[@]:-}"; do
+              [ -n "$t" ] || continue
+              if is_spec "$t"; then spec="${spec}${t} "; else junk="${junk}${t} "; fi
+            done
 
-          deleted=0
-          skipped=0
-          while IFS= read -r t; do
-            [ -n "$t" ] || continue
-            d="$(digest_of "$t" || true)"
-            if [ -z "$d" ]; then
-              echo "  跳过 ${t}: 取不到 digest"
-              skipped=$((skipped + 1)); continue
-            fi
-            if printf '%s' "$KEEP_DIGESTS" | grep -qxF "$d"; then
-              # 与某个规范 tag 共用 manifest，删 manifest 会连规范 tag 一起废掉
-              echo "  跳过 ${t}: 与规范 tag 共用 manifest ${d:0:20}"
-              skipped=$((skipped + 1)); continue
-            fi
-            if [ "${DRY_RUN}" = "true" ]; then
-              echo "  [dry-run] 将删除 ${t}  ${d:0:20}"
+            if [ -z "$spec" ]; then
+              # 没有任何规范 tag：整个 version 删掉（含 untagged 的旧版本）
+              if [ "${DRY_RUN}" = "true" ]; then
+                echo "  [dry-run] 删除 version ${vid}  tags=[${tags}]"
+              else
+                code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+                  -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                  "${API}/${vid}")"
+                echo "  删除 version ${vid} tags=[${tags}] -> HTTP ${code}"
+              fi
+              deleted=$((deleted + 1))
+            elif [ -n "$junk" ]; then
+              # 同一 version 上既有规范 tag 又有杂 tag：只摘掉杂 tag
+              spec_json="$(printf '%s' "$spec" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -sc .)"
+              if [ "${DRY_RUN}" = "true" ]; then
+                echo "  [dry-run] 摘 tag ${junk}（保留 ${spec}）version ${vid}"
+              else
+                code="$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+                  -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"metadata\":{\"container\":{\"tags\":${spec_json}}}}" \
+                  "${API}/${vid}")"
+                echo "  摘 tag ${junk}（保留 ${spec}）-> HTTP ${code}"
+              fi
+              patched=$((patched + 1))
             else
-              code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
-                -H "Authorization: Bearer ${TOKEN}" \
-                "https://ghcr.io/v2/${REPO}/manifests/${t}")"
-              echo "  删除 ${t} -> HTTP ${code}"
-              [ "$code" = "202" ] || [ "$code" = "200" ] || [ "$code" = "204" ] || true
+              keep=$((keep + 1))
             fi
-            deleted=$((deleted + 1))
-          done <<< "$DROP"
+          done < /tmp/versions.jsonl
 
           {
             echo "### tag 清理结果"
             echo ""
-            echo "- 处理 $(printf '%s\n' "$DROP" | grep -c . || true) 个非规范 tag"
-            echo "- 删除 ${deleted} 个，跳过 ${skipped} 个"
-            if [ "$skipped" -gt 0 ]; then
-              echo ""
-              echo "> 跳过的 tag 与规范 tag 共用 manifest，registry API 无法单独摘 tag。"
-              echo "> 它们在 GHCR 包页面上可手动删除，或等下次构建覆盖后自然消失。"
-            fi
+            echo "- 保留 ${keep} 个纯规范 version"
+            echo "- 删除 ${deleted} 个非规范 / untagged version"
+            echo "- 摘 tag ${patched} 个（同一 version 上混有杂 tag）"
+            echo "- dry_run=${DRY_RUN}"
           } >> "$GITHUB_STEP_SUMMARY"
