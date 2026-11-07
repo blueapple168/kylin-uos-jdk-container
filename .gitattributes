@@ -1,0 +1,9 @@
+# 统一换行符，避免 Windows 检出 CRLF 导致容器内 shell 脚本执行失败
+* text=auto eol=lf
+
+# 容器内执行的脚本必须 LF
+*.sh            text eol=lf
+Dockerfile*     text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.md            text eol=lf
