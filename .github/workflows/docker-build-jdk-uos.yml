@@ -562,6 +562,7 @@ jobs:
           IMAGE="${{ steps.meta.outputs.image }}"
           TAG_OLD="${{ steps.meta.outputs.tag_old }}"
           TAG_NEW="${{ steps.meta.outputs.tag_new }}"
+          VENDOR="${{ matrix.vendor }}"
 
           if [ -z "$TAG_NEW" ]; then
             # OpenJDK 变体：版本由 UOS 仓库决定，从构建产物里读实际装上的 NEVRA。
@@ -575,7 +576,7 @@ jobs:
               exit 1
             fi
             echo "==> 镜像内实际 JDK 版本: ${JDKVER}"
-            TAG_NEW="${{ matrix.os }}-${{ matrix.osver }}-${{ matrix.vendor }}-${JDKVER}"
+            TAG_NEW="${{ matrix.os }}-${{ matrix.osver }}-${VENDOR}-${JDKVER}"
             FLAVOR="${{ matrix.flavor }}"
             if [ -n "$FLAVOR" ]; then
               TAG_NEW="${TAG_NEW}-${FLAVOR}"
@@ -588,13 +589,36 @@ jobs:
           docker buildx imagetools create -t "${IMAGE}:${TAG_NEW}" "${IMAGE}:${TAG_OLD}"
           echo "tag_new=${TAG_NEW}" >> "$GITHUB_OUTPUT"
 
+          # 读镜像内真实 java 版本，写进产物供 README 版本表使用。
+          # openjdk 分支已 pull 过；其他变体这里补一次 pull。
+          if [ "$VENDOR" != "openjdk" ]; then
+            docker pull -q --platform linux/amd64 "${IMAGE}:${TAG_OLD}"
+          fi
+          JAVA_VER="$(docker run --rm --platform linux/amd64 --entrypoint sh "${IMAGE}:${TAG_OLD}" \
+            -c 'java -version 2>&1 | sed -n "1s/.*version \"\([^\"]*\)\".*/\1/p"')"
+          JAVA_VER="$(printf '%s' "$JAVA_VER" | tr -d '\r\n')"
+          echo "==> 镜像内 java -version: ${JAVA_VER:-读不到}"
+
+          mkdir -p out
+          printf '{"variant":"%s","dir":"%s","tag_old":"%s","tag_new":"%s","java_version":"%s"}\n' \
+            "${{ matrix.variant }}" "${{ matrix.dir }}" "${TAG_OLD}" "${TAG_NEW}" "${JAVA_VER}" \
+            > "out/${{ matrix.dir }}-${{ matrix.dockerfile }}.json"
+
           {
             echo "### 已推送 (${{ matrix.variant }})"
             echo ""
-            echo "| 规范 tag | 历史 tag |"
-            echo "|---|---|"
-            echo "| \`${TAG_NEW}\` | \`${TAG_OLD}\` |"
+            echo "| 规范 tag | 历史 tag | java -version |"
+            echo "|---|---|---|"
+            echo "| \`${TAG_NEW}\` | \`${TAG_OLD}\` | \`${JAVA_VER:-?}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 tag 与版本信息
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-meta-${{ matrix.dir }}-${{ matrix.dockerfile }}
+          path: out/*.json
+          if-no-files-found: warn
 
       - name: 校验 manifest 包含两个架构
         run: |
@@ -604,3 +628,50 @@ jobs:
             echo "--- ${t} ---"
             docker buildx imagetools inspect "${IMAGE}:${t}"
           done
+
+  # 所有变体构建完后，把最新的 tag 与 JDK 版本写回 README。
+  # 单独一个 job 而不是在 build-push 里各写各的：并发写同一文件必然冲突。
+  update-readme:
+    name: 更新 README 版本表
+    needs: [build-push]
+    if: >-
+      always() &&
+      needs.build-push.result == 'success' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'schedule')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载各变体的 tag 与版本
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-meta-*
+          merge-multiple: true
+          path: meta
+
+      - name: 重写 README 版本表
+        id: upd
+        run: |
+          set -eux
+          python3 .github/scripts/update-readme.py meta
+
+      - name: 有变化则提交
+        run: |
+          set -eux
+          if git diff --quiet -- README.md; then
+            echo "README 无变化，不提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: 更新 README 镜像版本表"
+          git push
+          echo "已提交 README 更新"
+

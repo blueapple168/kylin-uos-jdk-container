@@ -55,20 +55,26 @@
 - `-{特性}` 仅用于区分同系统同 JDK 的功能变体（如 `-ffmpeg`）
 - 变体清单集中维护在 `.github/variants.txt`，构建与验证两个工作流共用
 
-| 规范 tag | 历史 tag（保留为别名） |
-|---|---|
-| `uos-20-1070a-openjdk-1.8.0.412.b08-5.up2` | `jdk8` |
-| `uos-20-1070a-dragonwell-8.30.29-extended` | `jdk8-dragonwell` |
-| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2` | `jdk17` |
-| `uos-20-1070a-dragonwell-17.0.20.0.21-8-standard` | `jdk17-dragonwell` |
-| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2-ffmpeg` | `jdk17-ffmpeg` |
-| `uos-20-1070a-dragonwell-21.0.12.0.12-8-standard` | `jdk21-dragonwell` |
-| `uos-20-1070a-dragonwell-25.0.4.0.4-7-standard` | `jdk25-dragonwell` |
-| `uos-20-1070a-dragonwell-25.0.4.0.4-7-extended` | `jdk25-dragonwell-extended` |
-| `uos-20-1070a-temurin-25.0.5-8` | `jdk25-adoptium` |
-| `kylin-v11-2503-temurin-25.0.5-8` | `jdk25-adoptium-kylin` |
+<!-- VERSIONS:BEGIN 本块由构建工作流自动重写，不要手工编辑 -->
+| 规范 tag | 历史 tag（保留为别名） | 镜像内 `java -version` |
+|---|---|---|
+| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2.uelc20.01` | `jdk17` | `17.0.9` |
+| `uos-20-1070a-dragonwell-17.0.20.0.21-8-standard` | `jdk17-dragonwell` | `17.0.20` |
+| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2.uelc20.01-ffmpeg` | `jdk17-ffmpeg` | `17.0.9` |
+| `uos-20-1070a-dragonwell-21.0.12.0.12-8-standard` | `jdk21-dragonwell` | `21.0.12.0.12` |
+| `uos-20-1070a-temurin-25.0.5-8` | `jdk25-adoptium` | `25.0.5` |
+| `kylin-v11-2503-temurin-25.0.5-8` | `jdk25-adoptium-kylin` | `25.0.5` |
+| `uos-20-1070a-dragonwell-25.0.4.0.4-7-standard` | `jdk25-dragonwell` | `25.0.4.0.4` |
+| `uos-20-1070a-dragonwell-25.0.4.0.4-7-extended` | `jdk25-dragonwell-extended` | `25.0.4.0.4` |
+| `uos-20-1070a-openjdk-1.8.0.422.b05-0.up2.uelc20.01` | `jdk8` | `1.8.0_422` |
+| `uos-20-1070a-dragonwell-8.30.29-extended` | `jdk8-dragonwell` | `1.8.0_502` |
+<!-- VERSIONS:END -->
 
-> 表中 OpenJDK 两行是当前 UOS 仓库的版本，实际值以构建日志里 `==> 镜像内实际 JDK 版本` 为准。
+> 这张表由构建工作流在补打完规范 tag 后自动重写，值取自镜像里实际装上的 JDK。
+> OpenJDK 两行带 `.uelc20.01` 这类发行后缀，是 UOS 仓库的真实 NEVRA；
+> 仓库升级 JDK 后重建，tag 与这张表都会跟着变，不需要手工改。
+> 功能层面的验证结果（编译运行、MaxRAMPercentage、entrypoint 链路等）见
+> Actions 里 `镜像功能与版本验证` 的 job summary。
 
 每次构建会推：历史 tag、`<历史 tag>-<短 sha>`，以及构建后补上的规范 tag。
 历史 tag 保留是为了让已引用旧 tag 的使用方仍能拿到更新，后续可择机下线。
