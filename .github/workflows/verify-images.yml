@@ -322,7 +322,9 @@ jobs:
               [ -n "$5" ] && pairs="${pairs} jdk.version=$5"
               for kv in $pairs; do
                 k="${kv%%=*}"; want="${kv#*=}"
-                got="$(printf '%s' "$lb" | jq -r --arg k "$k" '.[$k] // ""')"
+                # label 里 JDK 版本保留原始的 +（25.0.5+8），tag 里必须换成 -（25.0.5-8），
+                # 比对前统一成 tag 形式，否则永远不等
+                got="$(printf '%s' "$lb" | jq -r --arg k "$k" '.[$k] // ""' | tr '+' '-')"
                 if [ "$got" = "$want" ]; then
                   label_rows="${label_rows}| \`${tag}\` | ${arch} | ${k} | ✅ ${got} |"$'\n'
                 else
