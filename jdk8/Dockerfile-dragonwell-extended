@@ -70,7 +70,9 @@ RUN set -euxo pipefail; \
     mkdir -p /usr/lib/jvm "${OTEL_HOME}" /app; \
     echo "Downloading: ${JDK_URL}"; \
     curl -Lf --retry 5 --retry-delay 2 --connect-timeout 15 "$JDK_URL" -o /tmp/jdk.tar.gz; \
-    JDK_DIR=$(tar -tzf /tmp/jdk.tar.gz | head -n1 | cut -d/ -f1); \
+    # 用 sed 而非 head: head 会提前关闭管道让 tar 收到 SIGPIPE(141)，
+    # 在 set -o pipefail + set -e 下会直接终止构建
+    JDK_DIR=$(tar -tzf /tmp/jdk.tar.gz | sed -n '1s|/.*$||p'); \
     tar -xzf /tmp/jdk.tar.gz -C /usr/lib/jvm/; \
     rm -f /tmp/jdk.tar.gz; \
     mv "/usr/lib/jvm/${JDK_DIR}" /usr/lib/jvm/java-1.8.0-dragonwell; \
