@@ -65,16 +65,16 @@ registry 上就是下面这 10 条，干净可枚举。
 <!-- VERSIONS:BEGIN 本块由构建工作流自动重写，不要手工编辑 -->
 | 镜像 tag | 镜像内 `java -version` |
 |---|---|
-| `uos-20-1070a-openjdk-1.8.0.422.b05-0.up2.uelc20.01` | `1.8.0_422` |
-| `uos-20-1070a-dragonwell-8.30.29-extended` | `1.8.0_502` |
-| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2.uelc20.01` | `17.0.9` |
-| `uos-20-1070a-dragonwell-17.0.20.0.21-8-standard` | `17.0.20` |
-| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2.uelc20.01-ffmpeg` | `17.0.9` |
-| `uos-20-1070a-dragonwell-21.0.12.0.12-8-standard` | `21.0.12.0.12` |
-| `uos-20-1070a-dragonwell-25.0.4.0.4-7-standard` | `25.0.4.0.4` |
-| `uos-20-1070a-dragonwell-25.0.4.0.4-7-extended` | `25.0.4.0.4` |
-| `uos-20-1070a-temurin-25.0.5-8` | `25.0.5` |
 | `kylin-v11-2503-temurin-25.0.5-8` | `25.0.5` |
+| `uos-20-1070a-dragonwell-17.0.20.0.21-8-standard` | `17.0.20` |
+| `uos-20-1070a-dragonwell-21.0.12.0.12-8-standard` | `21.0.12.0.12` |
+| `uos-20-1070a-dragonwell-25.0.4.0.4-7-extended` | `25.0.4.0.4` |
+| `uos-20-1070a-dragonwell-25.0.4.0.4-7-standard` | `25.0.4.0.4` |
+| `uos-20-1070a-dragonwell-8.30.29-extended` | `1.8.0_502` |
+| `uos-20-1070a-openjdk-1.8.0.422.b05-0.up2.uelc20.01` | `1.8.0_422` |
+| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2.uelc20.01` | `17.0.9` |
+| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2.uelc20.01-ffmpeg` | `17.0.9` |
+| `uos-20-1070a-temurin-25.0.5-8` | `25.0.5` |
 <!-- VERSIONS:END -->
 
 > 这张表由构建工作流在补打完规范 tag 后自动重写，值取自镜像里实际装上的 JDK。
