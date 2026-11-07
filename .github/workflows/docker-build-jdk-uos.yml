@@ -143,6 +143,8 @@ jobs:
               yum makecache -q >/dev/null 2>&1 || true
               yum list available ${pkg} 2>/dev/null | awk '/^${pkg}/{print \$2}' | tail -n1
             " | tr -d '\r\n')"
+            # yum list 的版本带 epoch 前缀（如 1:1.8.0.422...），Docker tag 不允许冒号，去掉它
+            ver="${ver#*:}"
             if [ -z "$ver" ]; then
               echo "::error::未能从 UOS 仓库查到 ${pkg} 的版本" >&2
               return 1

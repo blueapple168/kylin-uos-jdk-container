@@ -70,6 +70,8 @@ uos_jdk_version() {   # $1=包名，如 java-17-openjdk-devel
         yum makecache -q >/dev/null 2>&1 || true
         yum list available ${pkg} 2>/dev/null | awk '/^${pkg}/{print \$2}' | tail -n1
     " | tr -d '\r\n')"
+    # yum list 的版本带 epoch 前缀（如 1:1.8.0.422...），Docker tag 不允许冒号，去掉它
+    ver="${ver#*:}"
     [[ -n "${ver}" ]] || { echo "查不到 ${pkg} 的版本" >&2; return 1; }
     UOS_VER_CACHE[$pkg]="${ver}"
     printf '%s' "${ver}"
