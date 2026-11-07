@@ -32,9 +32,11 @@ LABEL org.opencontainers.image.authors="blueapple1120@qq.com" \
       org.opencontainers.image.version="1.0" \
       org.opencontainers.image.base.name="${BASE_IMAGE_REPO}:${BASE_IMAGE_TAG}" \
       org.opencontainers.image.description="Adoptium Temurin JDK 25 on Kylin Linux ${OS_VERSION} (multi-arch: amd64/arm64)" \
-      os="Kylin Linux" \
+      os="kylin" \
       os.version="${OS_VERSION}" \
       os.arch="amd64,arm64" \
+      jdk.vendor="temurin" \
+      jdk.version="${JDKVER_RAW}" \
       component="base-image"
 
 ARG BIN_DIR=/usr/local/bin

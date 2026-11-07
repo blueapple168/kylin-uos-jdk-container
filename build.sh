@@ -38,26 +38,44 @@ for a in "$@"; do
     esac
 done
 
-# 变体清单：目录|Dockerfile|镜像名后缀|变体短名
-ALL_VARIANTS=(
-    "jdk8|Dockerfile|jdk8|openjdk"
-    "jdk8|Dockerfile-dragonwell-extended|jdk8-dragonwell|dragonwell"
-    "jdk17|Dockerfile|jdk17|openjdk"
-    "jdk17|Dockerfile-dragonwell-standard|jdk17-dragonwell|dragonwell"
-    "jdk17-ffmpeg|Dockerfile|jdk17-ffmpeg|ffmpeg"
-    "jdk21|Dockerfile|jdk21-dragonwell|dragonwell"
-    "jdk25-lts|Dockerfile|jdk25-dragonwell|dragonwell"
-    "jdk25-lts|Dockerfile-dragonwell-extended|jdk25-dragonwell-extended|dragonwell"
-    "jdk25-lts|Dockerfile-adoptium|jdk25-adoptium|adoptium"
-    "jdk25-lts|Dockerfile-adoptium-kylinv11|jdk25-adoptium-kylin|kylin"
-)
+# 变体注册表由构建与验证 workflow 共用，字段含义见 .github/variants.txt 头部注释
+mapfile -t ALL_VARIANTS < <(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt)
+if [[ ${#ALL_VARIANTS[@]} -eq 0 ]]; then
+    echo "未读到任何变体，检查 .github/variants.txt" >&2
+    exit 1
+fi
+
+# 读 Dockerfile 里 ARG 的默认值并去掉两侧引号
+get_arg() {
+    local file="$1" name="$2"
+    sed -nE "s/^ARG[[:space:]]+${name}=([^ #]+).*/\1/p" "${file}" \
+        | head -n1 \
+        | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/'
+}
+
+# 按「系统-系统版本-发行版-JDK版本[-特性]」拼规范 tag。Docker tag 不允许 +，换成 -
+make_tag() {
+    local dir="$1" df="$2" os="$3" osver="$4" vendor="$5" flavor="$6"
+    local jdkver=""
+    case "${vendor}" in
+        openjdk)    jdkver="$(get_arg "${dir}/${df}" OPENJDK_VER)" ;;
+        dragonwell) jdkver="$(get_arg "${dir}/${df}" DRAGONWELL_RAW)" ;;
+        temurin)    jdkver="$(get_arg "${dir}/${df}" JDKVER_RAW)" ;;
+        *) echo "unknown vendor: ${vendor}" >&2; return 1 ;;
+    esac
+    [[ -n "${jdkver}" ]] || { echo "cannot parse JDK version: ${dir}/${df}" >&2; return 1; }
+    jdkver="${jdkver//+/-}"
+    local t="${os}-${osver}-${vendor}-${jdkver}"
+    [[ -n "${flavor}" ]] && t="${t}-${flavor}"
+    printf '%s' "${t}"
+}
 
 # 第 1 个参数按目录名前缀匹配，第 2 个参数按变体短名前缀匹配
 pick_variants() {
     local ver="${1:-}" name="${2:-}"
     local out=()
     for v in "${ALL_VARIANTS[@]}"; do
-        IFS='|' read -r dir df suffix short <<< "${v}"
+        IFS='|' read -r dir df suffix short v_os v_osver v_vendor v_flavor <<< "${v}"
         [[ -n "${ver}"  && "${dir}"    != "${ver}"* ]] && continue
         [[ -n "${name}" && "${short}"  != "${name}"* ]] && continue
         out+=("${v}")
@@ -66,8 +84,9 @@ pick_variants() {
 }
 
 build_one() {
-    local dir="$1" df="$2" suffix="$3"
-    local tag="${IMAGE_PREFIX}:${suffix}"
+    local dir="$1" df="$2" suffix="$3" new_tag="$4"
+    local tag_new="${IMAGE_PREFIX}:${new_tag}"
+    local tag_old="${IMAGE_PREFIX}:${suffix}"
 
     # --load 只能加载单个平台，剥离多平台列表
     local platforms="${PLATFORMS}"
@@ -76,7 +95,8 @@ build_one() {
     local cmd=(docker buildx build
         --file "${dir}/${df}"
         --platform "${platforms}"
-        --tag "${tag}"
+        --tag "${tag_new}"
+        --tag "${tag_old}"
         --build-arg "DUMB_INIT_VER=${DUMB_INIT_VER:-1.2.5}"
         --build-arg "GOSU_VER=${GOSU_VER:-1.20}"
         --build-arg "OTEL_AGENT_VER=${OTEL_AGENT_VER:-2.33.1}"
@@ -100,13 +120,14 @@ build_one() {
     fi
 
     if [[ "${IMAGE_TAG}" != "latest" ]]; then
-        cmd+=(--tag "${IMAGE_PREFIX}:${suffix}-${IMAGE_TAG}")
+        cmd+=(--tag "${IMAGE_PREFIX}:${new_tag}-${IMAGE_TAG}")
     fi
 
     cmd+=("${dir}")
 
     echo "------------------------------------------------------------"
     echo ">>> ${suffix}  (${dir}/${df})"
+    echo ">>> 规范 tag: ${new_tag}"
     echo ">>> platforms: ${platforms}"
     echo "------------------------------------------------------------"
     "${cmd[@]}"
@@ -119,13 +140,15 @@ if [[ ${#VARIANTS[@]} -eq 0 ]]; then
 fi
 
 for v in "${VARIANTS[@]}"; do
-    IFS='|' read -r dir df suffix short <<< "${v}"
-    build_one "${dir}" "${df}" "${suffix}"
+    IFS='|' read -r dir df suffix short v_os v_osver v_vendor v_flavor <<< "${v}"
+    new_tag="$(make_tag "${dir}" "${df}" "${v_os}" "${v_osver}" "${v_vendor}" "${v_flavor}")"
+    build_one "${dir}" "${df}" "${suffix}" "${new_tag}"
 done
 
 echo
 echo "完成。查看 manifest："
 for v in "${VARIANTS[@]}"; do
-    IFS='|' read -r dir df suffix short <<< "${v}"
-    echo "  docker buildx imagetools inspect ${IMAGE_PREFIX}:${suffix}"
+    IFS='|' read -r dir df suffix short v_os v_osver v_vendor v_flavor <<< "${v}"
+    new_tag="$(make_tag "${dir}" "${df}" "${v_os}" "${v_osver}" "${v_vendor}" "${v_flavor}")"
+    echo "  docker buildx imagetools inspect ${IMAGE_PREFIX}:${new_tag}"
 done

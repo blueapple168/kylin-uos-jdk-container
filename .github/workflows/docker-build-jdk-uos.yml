@@ -92,23 +92,15 @@ jobs:
           echo "mode=${mode}" >> "$GITHUB_STEP_SUMMARY" || true
           echo "WANT_VARIANT=${WANT_VARIANT}" >> "$GITHUB_STEP_SUMMARY" || true
 
-          # 变体注册表，与 build.sh 的 ALL_VARIANTS 对应:
-          #   目录|Dockerfile|镜像tag|变体短名|跟踪源
-          #   tag 兼作去重 key；跟踪源为空表示不参与自动升级，格式:
-          #     dragonwell:<仓库>:<产品线>   如 dragonwell17:standard（standard/extended 版本不同）
-          #     temurin:<主版本>             如 temurin:25 -> adoptium/temurin25-binaries
-          VARIANTS=(
-            "jdk8|Dockerfile|jdk8|openjdk|"
-            "jdk8|Dockerfile-dragonwell-extended|jdk8-dragonwell|dragonwell|dragonwell:dragonwell8:extended"
-            "jdk17|Dockerfile|jdk17|openjdk|"
-            "jdk17|Dockerfile-dragonwell-standard|jdk17-dragonwell|dragonwell|dragonwell:dragonwell17:standard"
-            "jdk17-ffmpeg|Dockerfile|jdk17-ffmpeg|ffmpeg|"
-            "jdk21|Dockerfile|jdk21-dragonwell|dragonwell|dragonwell:dragonwell21:standard"
-            "jdk25-lts|Dockerfile|jdk25-dragonwell|dragonwell|dragonwell:dragonwell25:standard"
-            "jdk25-lts|Dockerfile-dragonwell-extended|jdk25-dragonwell-extended|dragonwell|dragonwell:dragonwell25:extended"
-            "jdk25-lts|Dockerfile-adoptium|jdk25-adoptium|adoptium|temurin:25"
-            "jdk25-lts|Dockerfile-adoptium-kylinv11|jdk25-adoptium-kylin|kylin|temurin:25"
-          )
+          # 变体注册表从 .github/variants.txt 读取（构建与验证两个 workflow 共用同一份，
+          # 避免各维护一份导致不同步）。字段含义见该文件头部注释。
+          # 镜像 tag 一列是历史 tag（兼容用），新 tag 由 make_tag 按
+          # 「系统-系统版本-发行版-JDK版本[-特性]」生成，两者构建时同时推送。
+          mapfile -t VARIANTS < <(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt)
+          if [ "${#VARIANTS[@]}" -eq 0 ]; then
+            echo "::error::未读到任何变体，检查 .github/variants.txt" >&2
+            exit 1
+          fi
 
           # 提取 ARG 默认值并去掉两侧引号。必须去引号: Dockerfile 里带引号，
           # 而 release 解析出的版本不带，不 strip 会导致"永远不相等"→ 每次全量重建
@@ -131,6 +123,29 @@ jobs:
             esac
             # 值可能含 +（如 17.0.20.0.21+8），故用 | 作 sed 分隔符
             sed -i -E "s|^(ARG[[:space:]]+${name}=)[^ #]+|\1${quoted}|" "$file"
+          }
+
+          # 按「系统-系统版本-发行版-JDK版本[-特性]」拼新 tag。
+          # JDK 版本一律从 Dockerfile 的 ARG 读，保证 tag 承诺的内容与实际构建一致
+          # （upstream 模式改写 ARG 后，tag 自动跟随，不需要两处同时改）。
+          # Docker tag 不允许 +，统一换成 -。
+          make_tag() {
+            local dir="$1" df="$2" v_os="$3" v_osver="$4" v_vendor="$5" v_flavor="$6"
+            local jdkver=""
+            case "$v_vendor" in
+              openjdk)    jdkver="$(get_arg "${dir}/${df}" OPENJDK_VER)" ;;
+              dragonwell) jdkver="$(get_arg "${dir}/${df}" DRAGONWELL_RAW)" ;;
+              temurin)    jdkver="$(get_arg "${dir}/${df}" JDKVER_RAW)" ;;
+              *) echo "::error::${dir}/${df}: 未知发行版 ${v_vendor}" >&2; return 1 ;;
+            esac
+            if [ -z "$jdkver" ]; then
+              echo "::error::${dir}/${df}: 未能解析 JDK 版本 (发行版 ${v_vendor})" >&2
+              return 1
+            fi
+            jdkver="${jdkver//+/-}"
+            local t="${v_os}-${v_osver}-${v_vendor}-${jdkver}"
+            [ -n "$v_flavor" ] && t="${t}-${v_flavor}"
+            printf '%s' "$t"
           }
 
           matrix_arr=()
@@ -233,7 +248,7 @@ jobs:
             DW_TABLE=""
             DW_FAILED=""
             for v in "${VARIANTS[@]}"; do
-              IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+              IFS='|' read -r dir df tag short dwsrc v_os v_osver v_vendor v_flavor <<< "${v}"
               [ -n "$dwsrc" ] || continue
               if printf '%s' "$DW_TABLE" | grep -qF "${dwsrc}="; then
                 continue
@@ -258,7 +273,7 @@ jobs:
             stale_files=""
             stale_rows=""
             for v in "${VARIANTS[@]}"; do
-              IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+              IFS='|' read -r dir df tag short dwsrc v_os v_osver v_vendor v_flavor <<< "${v}"
               [ -n "$dwsrc" ] || continue
               f="${dir}/${df}"
               [ -f "$f" ] || continue
@@ -286,7 +301,7 @@ jobs:
               echo "| 变体 | 跟踪源 | ARG | 当前 | 上游最新 |"
               echo "|---|---|---|---|---|"
               for v in "${VARIANTS[@]}"; do
-                IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+                IFS='|' read -r dir df tag short dwsrc v_os v_osver v_vendor v_flavor <<< "${v}"
                 [ -n "$dwsrc" ] || continue
                 [ -f "${dir}/${df}" ] || continue
                 cur_arg="$(upstream_arg_name "$dwsrc")"
@@ -316,7 +331,7 @@ jobs:
             # 全部源失败则让 job 失败，否则定时任务会长期"静默成功"却漏掉新版本
             dw_total=0
             for v in "${VARIANTS[@]}"; do
-              IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+              IFS='|' read -r dir df tag short dwsrc v_os v_osver v_vendor v_flavor <<< "${v}"
               [ -n "$dwsrc" ] || continue
               dw_total=$((dw_total + 1))
             done
@@ -333,7 +348,7 @@ jobs:
               while IFS= read -r f; do
                 [ -n "$f" ] || continue
                 for v in "${VARIANTS[@]}"; do
-                  IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+                  IFS='|' read -r dir df tag short dwsrc v_os v_osver v_vendor v_flavor <<< "${v}"
                   [ "${dir}/${df}" = "$f" ] || continue
                   [ -n "$dwsrc" ] || continue
                   arg_name="$(upstream_arg_name "$dwsrc")"
@@ -349,13 +364,13 @@ jobs:
 
               # 只把受影响变体入矩阵
               for v in "${VARIANTS[@]}"; do
-                IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+                IFS='|' read -r dir df tag short dwsrc v_os v_osver v_vendor v_flavor <<< "${v}"
                 f="${dir}/${df}"
                 [ -f "$f" ] || continue
                 in_stale=0
                 if printf '%s' "$stale_files" | grep -qxF "$f"; then in_stale=1; fi
                 if [ "$in_stale" = "1" ]; then
-                  matrix_arr+=("{\"variant\":\"${f}\",\"dir\":\"${dir}\",\"dockerfile\":\"${df}\",\"tag\":\"${tag}\",\"dumb_init_ver\":\"$(get_arg "$f" DUMB_INIT_VER)\",\"gosu_ver\":\"$(get_arg "$f" GOSU_VER)\",\"otel_ver\":\"$(get_arg "$f" OTEL_AGENT_VER)\"}")
+                  matrix_arr+=("{\"variant\":\"${f}\",\"dir\":\"${dir}\",\"dockerfile\":\"${df}\",\"tag\":\"${tag}\",\"tag_new\":\"$(make_tag "$dir" "$df" "$v_os" "$v_osver" "$v_vendor" "$v_flavor")\",\"dumb_init_ver\":\"$(get_arg "$f" DUMB_INIT_VER)\",\"gosu_ver\":\"$(get_arg "$f" GOSU_VER)\",\"otel_ver\":\"$(get_arg "$f" OTEL_AGENT_VER)\"}")
                 fi
               done
               UPSTREAM_IMAGES="built"
@@ -388,7 +403,7 @@ jobs:
             hit_tags=""
             if [ -n "$files" ]; then
               while IFS= read -r v; do
-                IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+                IFS='|' read -r dir df tag short dwsrc v_os v_osver v_vendor v_flavor <<< "${v}"
                 [ -f "${dir}/${df}" ] || continue
                 if printf '%s\n' "$files" | grep -qxF "${dir}/${df}"; then
                   hit_tags="${hit_tags} ${tag}"
@@ -403,7 +418,7 @@ jobs:
             # 手工指定 variant 时按目录名 / tag 全量命中
             if [ -z "$(echo "$hit_tags" | tr -d ' ')" ] && [ -n "${WANT_VARIANT}" ]; then
               while IFS= read -r v; do
-                IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+                IFS='|' read -r dir df tag short dwsrc v_os v_osver v_vendor v_flavor <<< "${v}"
                 [ -f "${dir}/${df}" ] || continue
                 if [ "${dir}" = "${WANT_VARIANT}" ] || [ "${tag}" = "${WANT_VARIANT}" ]; then
                   hit_tags="${hit_tags} ${tag}"
@@ -418,13 +433,13 @@ jobs:
             fi
 
             for v in "${VARIANTS[@]}"; do
-              IFS='|' read -r dir df tag short dwsrc <<< "${v}"
+              IFS='|' read -r dir df tag short dwsrc v_os v_osver v_vendor v_flavor <<< "${v}"
               [ -f "${dir}/${df}" ] || continue
               case " ${hit_tags} " in
                 *" ${tag} "*)
                   cur="$(get_arg "${dir}/${df}" OTEL_AGENT_VER)"
                   test -n "$cur" || echo "::warning::${dir}/${df} 缺少 OTEL_AGENT_VER"
-                  matrix_arr+=("{\"variant\":\"${dir}/${df}\",\"dir\":\"${dir}\",\"dockerfile\":\"${df}\",\"tag\":\"${tag}\",\"dumb_init_ver\":\"$(get_arg "${dir}/${df}" DUMB_INIT_VER)\",\"gosu_ver\":\"$(get_arg "${dir}/${df}" GOSU_VER)\",\"otel_ver\":\"${cur}\"}")
+                  matrix_arr+=("{\"variant\":\"${dir}/${df}\",\"dir\":\"${dir}\",\"dockerfile\":\"${df}\",\"tag\":\"${tag}\",\"tag_new\":\"$(make_tag "$dir" "$df" "$v_os" "$v_osver" "$v_vendor" "$v_flavor")\",\"dumb_init_ver\":\"$(get_arg "${dir}/${df}" DUMB_INIT_VER)\",\"gosu_ver\":\"$(get_arg "${dir}/${df}" GOSU_VER)\",\"otel_ver\":\"${cur}\"}")
                   ;;
               esac
             done
@@ -461,7 +476,7 @@ jobs:
 
   # 构建并推送双架构 manifest
   build-push:
-    name: "推送镜像 (${{ matrix.tag }})"
+    name: "推送镜像 (${{ matrix.tag_new }})"
     needs: [detect]
     # PR 只跑 detect；矩阵为空时不能进入（空 include 会被判定为无构建向量）
     if: >-
@@ -502,16 +517,25 @@ jobs:
         id: meta
         run: |
           set -eux
-          TAG_NAME="${{ matrix.tag }}"
-          test -n "$TAG_NAME"
+          # 规范 tag：系统-系统版本-发行版-JDK版本[-特性]
+          TAG_NEW="${{ matrix.tag_new }}"
+          # 历史 tag，保留为别名，避免已引用旧 tag 的使用方拉不到更新
+          TAG_OLD="${{ matrix.tag }}"
+          test -n "$TAG_NEW"
+          test -n "$TAG_OLD"
           REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           IMAGE="${REGISTRY}/${REPO}"
-          VERSION_SUFFIX="${TAG_NAME#jdk}"   # 用于 cache scope
           {
             echo "image=${IMAGE}"
-            echo "tags=${IMAGE}:${TAG_NAME},${IMAGE}:${TAG_NAME}-${GITHUB_SHA::7}"
-            echo "scope=${VERSION_SUFFIX}"
+            echo "tags=${IMAGE}:${TAG_NEW},${IMAGE}:${TAG_OLD},${IMAGE}:${TAG_OLD}-${GITHUB_SHA::7}"
+            # cache scope 用规范 tag，旧 tag 变更（重命名变体）不会打散缓存
+            echo "scope=${TAG_NEW}"
           } >> "$GITHUB_OUTPUT"
+          {
+            echo "| 规范 tag | 历史 tag |"
+            echo "|---|---|"
+            echo "| \`${TAG_NEW}\` | \`${TAG_OLD}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 构建并推送 (amd64 + arm64 合并 manifest)
         uses: docker/build-push-action@v6

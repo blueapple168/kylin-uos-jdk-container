@@ -1,0 +1,25 @@
+# 变体注册表 —— 构建与验证两个 workflow 共用，改这里即可，不要在各 workflow 内重复维护
+#
+# 字段（以 | 分隔，共 9 个）:
+#   1 目录          jdk8 / jdk17 / jdk17-ffmpeg / jdk21 / jdk25-lts
+#   2 Dockerfile    该目录下的文件名
+#   3 历史 tag      保留为别名，老使用方按此拉取仍能拿到新镜像
+#   4 变体短名      用于 build.sh 的过滤参数
+#   5 跟踪源        空表示不参与自动升级；dragonwell:<仓库>:<产品线> 或 temurin:<主版本>
+#   6 系统          uos / kylin
+#   7 系统版本      20-1070a / v11-2503
+#   8 发行版        openjdk / dragonwell / temurin
+#   9 特性          空 / ffmpeg（仅用于区分同系统同 JDK 的功能变体）
+#
+# 规范 tag 由 make_tag 拼成「系统-系统版本-发行版-JDK版本[-特性]」，JDK 版本从
+# Dockerfile 的 ARG（OPENJDK_VER / DRAGONWELL_RAW / JDKVER_RAW）读取，不在此处写死。
+jdk8|Dockerfile|jdk8|openjdk||uos|20-1070a|openjdk|
+jdk8|Dockerfile-dragonwell-extended|jdk8-dragonwell|dragonwell|dragonwell:dragonwell8:extended|uos|20-1070a|dragonwell|extended
+jdk17|Dockerfile|jdk17|openjdk||uos|20-1070a|openjdk|
+jdk17|Dockerfile-dragonwell-standard|jdk17-dragonwell|dragonwell|dragonwell:dragonwell17:standard|uos|20-1070a|dragonwell|standard
+jdk17-ffmpeg|Dockerfile|jdk17-ffmpeg|ffmpeg||uos|20-1070a|openjdk|ffmpeg
+jdk21|Dockerfile|jdk21-dragonwell|dragonwell|dragonwell:dragonwell21:standard|uos|20-1070a|dragonwell|standard
+jdk25-lts|Dockerfile|jdk25-dragonwell|dragonwell|dragonwell:dragonwell25:standard|uos|20-1070a|dragonwell|standard
+jdk25-lts|Dockerfile-dragonwell-extended|jdk25-dragonwell-extended|dragonwell|dragonwell:dragonwell25:extended|uos|20-1070a|dragonwell|extended
+jdk25-lts|Dockerfile-adoptium|jdk25-adoptium|adoptium|temurin:25|uos|20-1070a|temurin|
+jdk25-lts|Dockerfile-adoptium-kylinv11|jdk25-adoptium-kylin|kylin|temurin:25|kylin|v11-2503|temurin|

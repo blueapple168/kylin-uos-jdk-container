@@ -22,21 +22,25 @@ ARG MIRROR_GITHUB=""
 
 ARG OS_VERSION=20-1070a
 
+# DRAGONWELL_RAW 写法 <版本号>+<build号>（无 build 号则只写版本，如 8.30.29）。
+# 下载链路由此推导：文件名把 + 换成 .，URL 路径把 + 转义为 %2B。
+# 必须放在 LABEL 之前，供 jdk.version 引用。
+ARG DRAGONWELL_RAW="17.0.20.0.21+8"
+
 LABEL org.opencontainers.image.authors="blueapple1120@qq.com" \
       org.opencontainers.image.version="1.0" \
       org.opencontainers.image.base.name="${BASE_IMAGE_REPO}/${BASE_IMAGE_TAG}" \
       org.opencontainers.image.description="Alibaba Dragonwell 17 Standard JDK on UOS (multi-arch: amd64/arm64)" \
-      os="UOS" \
+      os="uos" \
       os.version="${OS_VERSION}" \
       os.arch="amd64,arm64" \
+      jdk.vendor="dragonwell" \
+      jdk.version="${DRAGONWELL_RAW}" \
+      jdk.flavor="standard" \
       component="base-image"
 
 ARG BIN_DIR=/usr/local/bin
 ARG OTEL_HOME=/opt/otel/libs
-
-# DRAGONWELL_RAW 写法 <版本号>+<build号>（无 build 号则只写版本，如 8.30.29）。
-# 下载链路由此推导：文件名把 + 换成 .，URL 路径把 + 转义为 %2B。
-ARG DRAGONWELL_RAW="17.0.20.0.21+8"
 
 RUN set -euxo pipefail; \
     # ---- 0. 架构判别 ----

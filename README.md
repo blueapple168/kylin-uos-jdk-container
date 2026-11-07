@@ -13,6 +13,14 @@
 .
 ├── build.sh                 # 双架构构建入口（buildx + manifest 推送）
 ├── build-local.sh           # 本地单架构快速验证（--load，不推送）
+├── .github/
+│   ├── variants.txt                      # 变体注册表，构建与验证工作流共用
+│   ├── scripts/
+│   │   ├── verify-image.sh               # 容器内自检脚本（POSIX sh）
+│   │   └── summarize.py                  # 验证结果汇总为 Markdown 报告
+│   └── workflows/
+│       ├── docker-build-jdk-uos.yml      # 构建并推送双架构 manifest
+│       └── verify-images.yml             # 实际启动容器验证功能与版本
 ├── jdk8/
 │   ├── Dockerfile                        # OpenJDK 8
 │   ├── Dockerfile-dragonwell-extended    # Alibaba Dragonwell 8 Extended
@@ -24,7 +32,7 @@
 ├── jdk17-ffmpeg/
 │   └── Dockerfile                        # OpenJDK 17 + FFmpeg
 ├── jdk21/
-│   └── Dockerfile                        # Alibaba Dragonwell 21 Extended
+│   └── Dockerfile                        # Alibaba Dragonwell 21 Standard
 └── jdk25-lts/
     ├── Dockerfile                        # Alibaba Dragonwell 25 Standard
     ├── Dockerfile-dragonwell-extended    # Alibaba Dragonwell 25 Extended
@@ -34,6 +42,34 @@
 
 镜像内不再预置 `dumb-init`、`gosu`、`opentelemetry-javaagent.jar` 二进制，
 三者均在构建期在线下载并做 sha256 校验。
+
+---
+
+## 镜像 tag 命名
+
+规范格式：`{系统}-{系统版本}-{发行版}-{JDK版本}[-{特性}]`
+
+- JDK 版本取自 Dockerfile 的 ARG（`OPENJDK_VER` / `DRAGONWELL_RAW` / `JDKVER_RAW`），
+  **tag 承诺什么版本，镜像里就是什么版本**
+- Docker tag 不允许 `+`，一律替换为 `-`（如 `25.0.5+8` → `25.0.5-8`）
+- `-{特性}` 仅用于区分同系统同 JDK 的功能变体（如 `-ffmpeg`）
+- 变体清单集中维护在 `.github/variants.txt`，构建与验证两个工作流共用
+
+| 规范 tag | 历史 tag（保留为别名） |
+|---|---|
+| `uos-20-1070a-openjdk-1.8.0.412.b08-5.up2` | `jdk8` |
+| `uos-20-1070a-dragonwell-8.30.29-extended` | `jdk8-dragonwell` |
+| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2` | `jdk17` |
+| `uos-20-1070a-dragonwell-17.0.20.0.21-8-standard` | `jdk17-dragonwell` |
+| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2-ffmpeg` | `jdk17-ffmpeg` |
+| `uos-20-1070a-dragonwell-21.0.12.0.12-8-standard` | `jdk21-dragonwell` |
+| `uos-20-1070a-dragonwell-25.0.4.0.4-7-standard` | `jdk25-dragonwell` |
+| `uos-20-1070a-dragonwell-25.0.4.0.4-7-extended` | `jdk25-dragonwell-extended` |
+| `uos-20-1070a-temurin-25.0.5-8` | `jdk25-adoptium` |
+| `kylin-v11-2503-temurin-25.0.5-8` | `jdk25-adoptium-kylin` |
+
+每次构建会同时推三个 tag：规范 tag、历史 tag、`<历史 tag>-<短 sha>`。
+历史 tag 保留是为了让已引用旧 tag 的使用方仍能拿到更新，后续可择机下线。
 
 ---
 
@@ -105,6 +141,11 @@ docker buildx build --platform linux/amd64 -f jdk17/Dockerfile -t my/jdk17:amd64
 | `MIRROR_GITHUB` | 空 | GitHub 镜像代理前缀，内网构建时填写 |
 | `DRAGONWELL_RAW` | 各文件内定义 | Dragonwell 版本，写法 `<版本号>+<build号>`（**自动跟踪**） |
 | `JDKVER_RAW` | `25.0.5+8` | Temurin 版本，仅 adoptium 变体（**自动跟踪**） |
+| `OPENJDK_VER` | 各文件内定义 | UOS 仓库 `java-*-openjdk-devel` 的 `<version>-<release>`（**锁死，不自动跟踪**） |
+
+`OPENJDK_VER` 必须锁死：镜像 tag 里承诺了这个版本，装到别的 build 就等于 tag 撒谎。
+构建期会用 `rpm -q --qf '%{VERSION}-%{RELEASE}'` 复核实际装上的 NEVRA，不符直接失败。
+UOS 仓库清理旧版时构建会报错，这是正确信号——改 ARG 再重建即可。
 
 三者均从 GitHub 官方 release 下载并做 sha256 校验：
 
@@ -128,8 +169,8 @@ MIRROR_GITHUB=https://ghproxy.example.com/https://github.com ./build.sh jdk17
 
 | 触发 | 行为 |
 |---|---|
-| push 到 master（改 `jdk*/Dockerfile*`、`jdk*/docker-entrypoint.sh`、`build.sh`） | 按变更文件精确匹配变体，构建并推送双架构 manifest |
-| pull_request 到 master | 只跑 `detect` 做矩阵校验，不推镜像 |
+| push 到 main（改 `jdk*/Dockerfile*`、`jdk*/docker-entrypoint.sh`、`build.sh`） | 按变更文件精确匹配变体，构建并推送双架构 manifest |
+| pull_request 到 main | 只跑 `detect` 做矩阵校验，不推镜像 |
 | schedule（每日 UTC 02:00 / 北京 10:00） | 检查上游 JDK 新版本，有更新则升级并重建 |
 | workflow_dispatch | 手动指定 `variant`（如 `jdk17`、`jdk25-adoptium`）或勾选 `check_upstream` |
 
@@ -150,11 +191,48 @@ MIRROR_GITHUB=https://ghproxy.example.com/https://github.com ./build.sh jdk17
 
 - Dragonwell 的 `standard` 与 `extended` 是两条独立产品线，版本号不同，**按产品线分别跟踪**，不会互相覆盖。
 - Temurin 只认 GA 版 tag（`jdk-25.0.6+9`），带 `-ea` 的抢先版一律排除，避免未 GA 构建流入生产镜像。
-- 检测到新版本时：改写对应 ARG → 提交 commit 回 master → **只重建确实落后的变体**（非全量）。
+- 检测到新版本时：改写对应 ARG → 提交 commit 回 main → **只重建确实落后的变体**（非全量）。
 - `dumb-init` / `gosu` / `otel-agent` **不参与**自动升级，需要时手工修改 ARG（这三个组件的校验文件格式随版本变动，自动升级风险高于收益）。
 
 > 注：GitHub API 未认证请求限额 60 次/小时，workflow 会显式传入 `GITHUB_TOKEN`（限额 1000 次/小时）。
 > 若所有跟踪源都查询失败，`detect` job 会直接失败而非静默通过——防止定任务长期"空转成功"却漏掉新版本。
+
+---
+
+## 自动化：镜像功能与版本验证
+
+工作流文件：`.github/workflows/verify-images.yml`
+
+构建成功不代表镜像能用——包名写错、JDK 版本漂移、entrypoint 链路断掉都可能在构建
+"成功"的情况下发生。这个工作流把每个变体、每个架构**实际启动起来**逐项检查。
+
+### 触发方式
+
+| 触发 | 行为 |
+|---|---|
+| `workflow_run`（构建工作流完成后） | 自动全量验证 10 变体 × 2 架构 |
+| `workflow_dispatch` | 手动跑，`variant` 可填历史 tag 或规范 tag 只验证一个，`platforms` 可只选单架构 |
+| schedule（每日 UTC 04:00 / 北京 12:00） | 巡检，防止镜像被覆盖或上游漂移 |
+
+### 检查项
+
+| 类别 | 项目 |
+|---|---|
+| 镜像 label | `os`、`os.version`、`jdk.vendor`、`jdk.version` 与预期一致 |
+| 系统 | `/etc/os-release` 的 ID 与 PRETTY_NAME、`uname -m` 架构 |
+| JDK | `java -version` / `javac -version` 主版本、`java.vendor` 发行商、`JAVA_HOME` 与 `java.home` 一致性 |
+| 功能 | 现场写 `Hello.java` → `javac` 编译 → `java` 运行，输出校验；JDK 9+ 的模块数 |
+| JVM 参数 | 带 `JAVA_OPTS` 时 `MaxRAMPercentage` 实际为 75.0 |
+| 运行时组件 | `dumb-init --version`、`gosu --version`、`app` 用户 uid=1000、OTel Agent jar |
+| 链路 | 默认 entrypoint 跑 `id`，输出 `uid=1000(app)` 说明 dumb-init → entrypoint → gosu 全通 |
+| 环境 | 时区 `Asia/Shanghai`、中文 locale |
+| 特性 | `ffmpeg` 变体额外检查 `ffmpeg -version` |
+
+检查脚本在 `.github/scripts/verify-image.sh`，只用 POSIX sh + coreutils
+（Kylin minimal 没有 bash，写 bash 专有语法会直接跑不起来）。
+
+结果汇总在 job summary 的 Markdown 报告里，同时上传 `verify-report` artifact；
+任何检查项 FAIL 会让工作流整体失败。
 
 ---
 

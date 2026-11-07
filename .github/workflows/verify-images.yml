@@ -1,0 +1,321 @@
+name: 镜像功能与版本验证
+
+# 对每个变体、每个架构实际启动容器，逐项验证：
+#   系统标识 / 架构 / java+javac 版本与发行商 / JAVA_HOME / 编译运行 / MaxRAMPercentage
+#   dumb-init / gosu / app 用户 / OTel Agent / entrypoint / 时区 / 中文 locale / FFmpeg
+#
+# 触发方式:
+#   workflow_run      构建 workflow 成功后自动跑（全量，保证覆盖）
+#   workflow_dispatch 手动跑，可只验证某个变体或单个架构
+#   schedule          每日巡检，防止镜像被覆盖或上游漂移
+#
+# 变体清单读 .github/variants.txt，与构建 workflow 共用同一份，避免两处不同步。
+
+on:
+  workflow_run:
+    workflows: ["JDK UOS 双架构镜像构建"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "只验证指定变体（填历史 tag 或规范 tag，如 jdk17 / uos-20-1070a-openjdk-17.0.9.0.9-2.0.2；留空验证全部）"
+        required: false
+        default: ""
+      platforms:
+        description: "验证的架构，逗号分隔；留空为 amd64+arm64"
+        required: false
+        default: "linux/amd64,linux/arm64"
+  schedule:
+    # 每日 UTC 04:00（北京 12:00），与构建 workflow 的 02:00 错开
+    - cron: "0 4 * * *"
+
+concurrency:
+  group: verify-images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: read
+  actions: read
+
+jobs:
+  plan:
+    name: 生成验证矩阵
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 计算验证矩阵
+        id: set
+        env:
+          WANT: ${{ github.event.inputs.variant }}
+          PLATS: ${{ github.event.inputs.platforms }}
+        run: |
+          set -eux
+          WANT="${WANT:-}"
+          PLATS="${PLATS:-}"
+          [ -n "$PLATS" ] || PLATS="linux/amd64,linux/arm64"
+
+          # 提取 ARG 默认值并去掉两侧引号，与构建 workflow 的 get_arg 保持一致
+          get_arg() {
+            sed -nE "s/^ARG[[:space:]]+$2=([^ #]+).*/\1/p" "$1" \
+              | head -n1 \
+              | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/'
+          }
+
+          # 按「系统-系统版本-发行版-JDK版本[-特性]」拼规范 tag，与构建 workflow 一致
+          make_tag() {
+            local dir="$1" df="$2" v_os="$3" v_osver="$4" v_vendor="$5" v_flavor="$6"
+            local jdkver=""
+            case "$v_vendor" in
+              openjdk)    jdkver="$(get_arg "${dir}/${df}" OPENJDK_VER)" ;;
+              dragonwell) jdkver="$(get_arg "${dir}/${df}" DRAGONWELL_RAW)" ;;
+              temurin)    jdkver="$(get_arg "${dir}/${df}" JDKVER_RAW)" ;;
+            esac
+            [ -n "$jdkver" ] || { echo "::error::${dir}/${df}: 解析不到 JDK 版本" >&2; return 1; }
+            jdkver="${jdkver//+/-}"
+            local t="${v_os}-${v_osver}-${v_vendor}-${jdkver}"
+            [ -n "$v_flavor" ] && t="${t}-${v_flavor}"
+            printf '%s' "$t"
+          }
+
+          # 期望 JDK 版本要原样传给容器内脚本（保留 +，脚本自己判主版本）
+          jdk_raw() {
+            local dir="$1" df="$2" vendor="$3"
+            case "$vendor" in
+              openjdk)    get_arg "${dir}/${df}" OPENJDK_VER ;;
+              dragonwell) get_arg "${dir}/${df}" DRAGONWELL_RAW ;;
+              temurin)    get_arg "${dir}/${df}" JDKVER_RAW ;;
+            esac
+          }
+
+          matrix_arr=()
+          while IFS='|' read -r dir df tag_old short dwsrc v_os v_osver v_vendor v_flavor; do
+            [ -n "$dir" ] || continue
+            [ -f "${dir}/${df}" ] || { echo "::warning::跳过不存在的 ${dir}/${df}"; continue; }
+            tag_new="$(make_tag "$dir" "$df" "$v_os" "$v_osver" "$v_vendor" "$v_flavor")"
+
+            # 手工指定变体时，历史 tag 或规范 tag 任一命中即保留
+            if [ -n "$WANT" ] && [ "$WANT" != "$tag_old" ] && [ "$WANT" != "$tag_new" ]; then
+              continue
+            fi
+
+            jdk_ver="$(jdk_raw "$dir" "$df" "$v_vendor")"
+            # 架构列表按逗号拆开，一个架构一个矩阵项
+            echo "$PLATS" | tr ',' '\n' | while read -r plat; do
+              [ -n "$plat" ] || continue
+              arch="${plat##*/}"
+              printf '%s\n' "{\"tag\":\"${tag_new}\",\"tag_old\":\"${tag_old}\",\"arch\":\"${arch}\",\"platform\":\"${plat}\",\"os\":\"${v_os}\",\"osver\":\"${v_osver}\",\"vendor\":\"${v_vendor}\",\"jdkver\":\"${jdk_ver}\",\"flavor\":\"${v_flavor}\"}"
+            done >> /tmp/rows.txt
+          done < <(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt)
+
+          if [ -s /tmp/rows.txt ]; then
+            matrix="[$(paste -sd, /tmp/rows.txt)]"
+          else
+            matrix="[]"
+          fi
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+          # 报告用的清单表
+          {
+            echo "### 本次验证的镜像"
+            echo ""
+            echo "| 规范 tag | 历史 tag | 架构 |"
+            echo "|---|---|---|"
+            printf '%s\n' "$matrix" | jq -r '.[] | "| `\(.tag)` | `\(.tag_old)` | \(.arch) |"' 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+  verify:
+    name: "验证 (${{ matrix.tag }} / ${{ matrix.arch }})"
+    needs: [plan]
+    if: >-
+      always() &&
+      needs.plan.outputs.matrix != '[]' &&
+      needs.plan.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix || '[]') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 QEMU (arm64 需要)
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 拉取镜像
+        id: pull
+        run: |
+          set -eux
+          IMAGE="${REGISTRY}/$(echo '${{ github.repository }}' | tr 'A-Z' 'a-z'):${{ matrix.tag }}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          if docker pull --platform "${{ matrix.platform }}" "${IMAGE}"; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::镜像不存在或拉取失败: ${IMAGE} (${{ matrix.platform }})，跳过验证"
+          fi
+
+      - name: 校验镜像 label
+        id: labels
+        if: steps.pull.outputs.ok == '1'
+        run: |
+          set -eux
+          IMAGE="${{ steps.pull.outputs.image }}"
+          LABELS="$(docker inspect --format '{{json .Config.Labels}}' "${IMAGE}")"
+          echo "${LABELS}" | jq .
+
+          fails=0
+          chk() {   # $1=label 键  $2=期望值
+            local got
+            got="$(echo "${LABELS}" | jq -r --arg k "$1" '.[$k] // ""')"
+            if [ "${got}" = "$2" ]; then
+              printf 'PASS\tlabel %s\t%s\n' "$1" "${got}"
+            else
+              printf 'FAIL\tlabel %s\t期望 %s，实际 %s\n' "$1" "$2" "${got:-空}"
+              fails=$((fails + 1))
+            fi
+          }
+          # 检查结果必须落盘，否则汇总步骤读不到（printf 默认只打到日志）
+          {
+            chk os          "${{ matrix.os }}"
+            chk os.version  "${{ matrix.osver }}"
+            chk jdk.vendor  "${{ matrix.vendor }}"
+            chk jdk.version "${{ matrix.jdkver }}"
+            printf 'SUMMARY\tFAIL\t%s\n' "${fails}"
+          } | tee /tmp/labels.tsv
+
+      - name: 容器内功能与版本自检
+        id: selftest
+        if: steps.pull.outputs.ok == '1'
+        run: |
+          set -eux
+          IMAGE="${{ steps.pull.outputs.image }}"
+          docker run --rm --platform "${{ matrix.platform }}" \
+            --entrypoint sh \
+            -v "${GITHUB_WORKSPACE}/.github/scripts/verify-image.sh:/verify.sh:ro" \
+            "${IMAGE}" /verify.sh \
+              "${{ matrix.os }}" \
+              "${{ matrix.osver }}" \
+              "${{ matrix.vendor }}" \
+              "${{ matrix.jdkver }}" \
+              "${{ matrix.arch }}" \
+              "${{ matrix.flavor }}" \
+            | tee /tmp/selftest.tsv
+
+      - name: 验证 entrypoint 链路 (dumb-init -> gosu app)
+        id: entrypoint
+        if: steps.pull.outputs.ok == '1'
+        run: |
+          set -eux
+          IMAGE="${{ steps.pull.outputs.image }}"
+          # 默认 ENTRYPOINT 是 dumb-init -- docker-entrypoint.sh，末尾 exec gosu app "$@"
+          # 传 id 进去，能输出 uid=1000(app) 就说明整条链路通
+          OUT="$(docker run --rm --platform "${{ matrix.platform }}" "${IMAGE}" id 2>&1 || true)"
+          echo "${OUT}"
+          case "${OUT}" in
+            *"uid=1000"*) printf 'PASS\tentrypoint 链路\t%s\n' "${OUT}" ;;
+            *)            printf 'FAIL\tentrypoint 链路\t%s\n' "${OUT}" ;;
+          esac > /tmp/entrypoint.tsv
+
+      - name: 汇总本变体结果
+        if: always()
+        run: |
+          set -eu
+          mkdir -p out
+          python3 - <<'PY' > "out/${{ matrix.arch }}-${{ matrix.tag }}.json"
+          import json, os, glob
+          rows, fails = [], 0
+          for f in ("/tmp/labels.tsv", "/tmp/selftest.tsv", "/tmp/entrypoint.tsv"):
+              if not os.path.exists(f):
+                  continue
+              for line in open(f, encoding="utf-8", errors="replace"):
+                  line = line.rstrip("\n")
+                  if not line:
+                      continue
+                  parts = line.split("\t")
+                  if parts[0] == "SUMMARY":
+                      fails += int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+                      continue
+                  if len(parts) >= 3:
+                      rows.append({"status": parts[0], "item": parts[1], "detail": parts[2]})
+          if not rows:
+              fails += 1
+              rows.append({"status": "FAIL", "item": "整体", "detail": "镜像拉取失败，未产生任何检查结果"})
+          print(json.dumps({
+              "tag": "${{ matrix.tag }}",
+              "tag_old": "${{ matrix.tag_old }}",
+              "arch": "${{ matrix.arch }}",
+              "platform": "${{ matrix.platform }}",
+              "vendor": "${{ matrix.vendor }}",
+              "jdkver": "${{ matrix.jdkver }}",
+              "fails": fails,
+              "checks": rows,
+          }, ensure_ascii=False, indent=2))
+          PY
+          cat "out/${{ matrix.arch }}-${{ matrix.tag }}.json"
+
+      - name: 上传本变体结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.arch }}-${{ matrix.tag }}
+          path: out/*.json
+          if-no-files-found: warn
+
+  report:
+    name: 生成验证报告
+    needs: [plan, verify]
+    if: always() && needs.plan.outputs.matrix != '[]' && needs.plan.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载全部结果
+        uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          merge-multiple: true
+          path: results
+
+      - name: 汇总报告
+        run: |
+          set -eu
+          python3 .github/scripts/summarize.py results | tee /tmp/report.md
+          cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 失败则让 job 失败
+        run: |
+          set -eu
+          total_fail="$(python3 .github/scripts/summarize.py results --total-fails)"
+          echo "失败检查项总数: ${total_fail}"
+          if [ "${total_fail}" -gt 0 ]; then
+            echo "::error::验证发现 ${total_fail} 处失败，详见上方报告"
+            exit 1
+          fi
+
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report
+          path: |
+            results
+            /tmp/report.md
+          if-no-files-found: warn
