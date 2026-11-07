@@ -672,6 +672,107 @@ jobs:
 
   # 所有变体构建完后，把最新的 tag 与 JDK 版本写回 README。
   # 单独一个 job 而不是在 build-push 里各写各的：并发写同一文件必然冲突。
+  # 每个变体只留最新的一个 tag：JDK 升级后旧版本 tag 会自动清掉。
+  # 应保留的 tag 直接取构建产物（build-meta-*），与本次实际推的一致，不重复推导。
+  cleanup-old-tags:
+    name: 清理同变体的旧 tag
+    needs: [build-push]
+    if: >-
+      always() &&
+      needs.build-push.result == 'success' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'schedule')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: 下载本次构建的 tag
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-meta-*
+          merge-multiple: true
+          path: meta
+
+      - name: 删除旧规范 tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          PKG="$(echo '${{ github.repository }}' | cut -d/ -f2 | tr 'A-Z' 'a-z')"
+          API="https://api.github.com/user/packages/container/${PKG}/versions"
+
+          # 本次构建产出的 tag，这些必须保留
+          KEEP="$(cat meta/*.json | jq -r '.tag' | sort -u)"
+          KEEP_N="$(printf '%s\n' "$KEEP" | grep -c . || true)"
+          echo "本次保留 ${KEEP_N} 个 tag:"
+          printf '  %s\n' $KEEP
+
+          # 拉全部 version（含 untagged 的子 manifest，只读不删）
+          : > /tmp/versions.jsonl
+          page=1
+          while :; do
+            chunk="$(curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${API}?per_page=100&page=${page}")"
+            n="$(printf '%s' "$chunk" | jq 'length')"
+            [ "$n" -gt 0 ] || break
+            printf '%s' "$chunk" | jq -c '.[]' >> /tmp/versions.jsonl
+            [ "$n" -lt 100 ] && break
+            page=$((page + 1))
+          done
+          echo "registry 共 $(grep -c . /tmp/versions.jsonl || true) 个 version"
+
+          deleted=0
+          patched=0
+          while IFS= read -r v; do
+            [ -n "$v" ] || continue
+            vid="$(printf '%s' "$v" | jq -r '.id')"
+            tags="$(printf '%s' "$v" | jq -r '[.metadata.container.tags[]?] | join(",")')"
+            # 没有 tag 的是子 manifest（amd64 / arm64），删了镜像就 pull 不到，必须跳过
+            [ -n "$tags" ] || continue
+
+            keep_here=""
+            drop_here=""
+            IFS=',' read -ra arr <<< "$tags"
+            for t in "${arr[@]:-}"; do
+              [ -n "$t" ] || continue
+              if printf '%s\n' "$KEEP" | grep -qxF "$t"; then
+                keep_here="${keep_here}${t} "
+              else
+                drop_here="${drop_here}${t} "
+              fi
+            done
+
+            if [ -z "$keep_here" ] && [ -n "$drop_here" ]; then
+              # 整个 version 上都是旧 tag：连 version 一起删（子 manifest 会跟着回收）
+              code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+                -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                "${API}/${vid}")"
+              echo "  删除 version ${vid}（旧 tag: ${drop_here}）-> HTTP ${code}"
+              deleted=$((deleted + 1))
+            elif [ -n "$drop_here" ]; then
+              # 新旧 tag 混在同一 version：只摘掉旧的
+              keep_json="$(printf '%s' "$keep_here" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -sc .)"
+              code="$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+                -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" \
+                -d "{\"metadata\":{\"container\":{\"tags\":${keep_json}}}}" \
+                "${API}/${vid}")"
+              echo "  摘掉旧 tag ${drop_here}（保留 ${keep_here}）-> HTTP ${code}"
+              patched=$((patched + 1))
+            fi
+          done < /tmp/versions.jsonl
+
+          {
+            echo "### 旧 tag 清理"
+            echo ""
+            echo "- 删除 ${deleted} 个纯旧 tag 的 version"
+            echo "- 摘 tag ${patched} 个（新旧混在同一 version）"
+            echo "- 无 tag 的子 manifest 一律跳过，不动"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   update-readme:
     name: 更新 README 版本表
     needs: [build-push]
