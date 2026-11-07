@@ -81,13 +81,37 @@ jobs:
           KNOWN_FLAVORS="$(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt \
             | awk -F'|' '$9 != "" {print $9}' | sort -u | tr '\n' ' ')"
 
-          # $1=os $2=osver $3=vendor $4=flavor，输出匹配的规范 tag（多个取版本最大）
+          # JDK 主版本前缀：openjdk 三个变体的 tag 前缀完全一样（uos-20-1070a-openjdk-），
+          # 只能靠版本段开头区分（1.8.0.422... vs 17.0.9...）。
+          # $1=vendor $2=dir $3=df，输出如 1.8 / 17 / 8 / 25
+          major_prefix() {
+            local v=""
+            case "$1" in
+              openjdk)
+                v="$(grep -oE 'java-[0-9.]+-openjdk-devel' "$2/$3" | head -n1 \
+                     | sed 's/^java-//; s/-openjdk-devel$//')"
+                case "$v" in
+                  1.8*) printf '1.8' ;;
+                  *)    printf '%s' "${v%%.*}" ;;
+                esac
+                ;;
+              dragonwell) v="$(get_arg "$2/$3" DRAGONWELL_RAW)"; printf '%s' "${v%%.*}" ;;
+              temurin)    v="$(get_arg "$2/$3" JDKVER_RAW)"; printf '%s' "${v%%.*}" ;;
+            esac
+          }
+
+          # $1=os $2=osver $3=vendor $4=flavor $5=主版本前缀，输出匹配的规范 tag
           pick_tag() {
-            local prefix="$1-$2-$3-" cand t f skip
+            local prefix="$1-$2-$3-" cand t f skip rest
             cand="$(printf '%s\n' "$ALL_TAGS" | grep -F "$prefix" | grep -v '^$' || true)"
             [ -n "$cand" ] || return 1
             while IFS= read -r t; do
               [ -n "$t" ] || continue
+              rest="${t#$prefix}"
+              # 版本段必须以该 JDK 的主版本开头，否则会把 jdk8 错配到 jdk17 的 tag
+              if [ -n "$5" ]; then
+                case "$rest" in "$5"*) ;; *) continue ;; esac
+              fi
               if [ -n "$4" ]; then
                 case "$t" in *"-$4") printf '%s' "$t"; return 0 ;; esac
               else
@@ -118,7 +142,8 @@ jobs:
             [ -f "${dir}/${df}" ] || { echo "::warning::跳过不存在的 ${dir}/${df}"; continue; }
 
             # 从 registry 反查该变体的规范 tag；查不到说明还没构建过，跳过并提示
-            if ! tag="$(pick_tag "$v_os" "$v_osver" "$v_vendor" "$v_flavor")"; then
+            major="$(major_prefix "$v_vendor" "$dir" "$df")"
+            if ! tag="$(pick_tag "$v_os" "$v_osver" "$v_vendor" "$v_flavor" "$major")"; then
               echo "::warning::${dir}/${df}: registry 上找不到 ${v_os}-${v_osver}-${v_vendor}-* 的 tag，跳过"
               continue
             fi
@@ -313,11 +338,36 @@ jobs:
             [ -f "${dir}/${df}" ] || continue
             prefix="${v_os}-${v_osver}-${v_vendor}-"
 
-            # 该变体应有的 tag：前缀匹配 + 特性后缀匹配
+            # JDK 主版本前缀，用于区分 openjdk 8 / 17（两者 tag 前缀相同）
+            major=""
+            case "$v_vendor" in
+              openjdk)
+                vpkg="$(grep -oE 'java-[0-9.]+-openjdk-devel' "${dir}/${df}" | head -n1 \
+                        | sed 's/^java-//; s/-openjdk-devel$//')"
+                case "$vpkg" in
+                  1.8*) major="1.8" ;;
+                  *)    major="${vpkg%%.*}" ;;
+                esac
+                ;;
+              dragonwell)
+                vraw="$(sed -nE 's/^ARG[[:space:]]+DRAGONWELL_RAW=([^ #]+).*/\1/p' "${dir}/${df}" | head -n1 | tr -d '"')"
+                major="${vraw%%.*}"
+                ;;
+              temurin)
+                vraw="$(sed -nE 's/^ARG[[:space:]]+JDKVER_RAW=([^ #]+).*/\1/p' "${dir}/${df}" | head -n1 | tr -d '"')"
+                major="${vraw%%.*}"
+                ;;
+            esac
+
+            # 该变体应有的 tag：前缀匹配 + 主版本匹配 + 特性后缀匹配
             hit=""
             while IFS= read -r t; do
               [ -n "$t" ] || continue
               case "$t" in "$prefix"*) ;; *) continue ;; esac
+              rest="${t#$prefix}"
+              if [ -n "$major" ]; then
+                case "$rest" in "$major"*) ;; *) continue ;; esac
+              fi
               if [ -n "$v_flavor" ]; then
                 case "$t" in *"-$v_flavor") hit="$t" ;; esac
               else
