@@ -46,15 +46,15 @@ def emit_report(items: list[dict]) -> None:
           f"✅ 通过 {n_pass} ／ ⚠️ 告警 {n_warn} ／ ❌ 失败 {n_fail}\n")
 
     print("### 总览\n")
-    print("| 规范 tag | 历史 tag | 架构 | 发行版 | 期望 JDK | 实际 java 版本 | 结果 |")
-    print("|---|---|---|---|---|---|---|")
+    print("| 镜像 tag | 架构 | 发行版 | 期望 JDK | 实际 java 版本 | 结果 |")
+    print("|---|---|---|---|---|---|")
     for item in items:
         actual = next((c["detail"] for c in item.get("checks", [])
                        if c["item"] == "JDK 版本"), "-")
         # 详情里带了「（主版本 X）」的说明，报告里只留版本号
         actual = actual.split("（")[0].strip()
         st = status_of(item)
-        print(f"| `{item.get('tag','')}` | `{item.get('tag_old','')}` | {item.get('arch','')} "
+        print(f"| `{item.get('tag','')}` | {item.get('arch','')} "
               f"| {item.get('vendor','')} | {item.get('jdkver','')} | {actual} | {badge(st)} |")
 
     # 只列失败与告警，通过的项不必刷屏

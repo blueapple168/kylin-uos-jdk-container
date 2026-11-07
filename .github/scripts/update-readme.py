@@ -7,7 +7,7 @@
     update-readme.py <结果目录> --check   只检查是否需要更新，需要则退出码 10
 
 结果目录里每个文件形如:
-    {"variant":"jdk8/Dockerfile","tag_old":"jdk8","tag_new":"uos-...","jdk_version":"...","java_version":"1.8.0_422"}
+    {"variant":"jdk8/Dockerfile","dir":"jdk8","tag":"uos-...","java_version":"1.8.0_422"}
 """
 import json
 import sys
@@ -24,22 +24,21 @@ def load(results_dir: Path) -> list[dict]:
             rows.append(json.loads(f.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError) as exc:
             print(f"跳过无法解析的 {f.name}: {exc}", file=sys.stderr)
-    # 按历史 tag 排序，顺序稳定，避免每次提交产生无意义 diff
-    rows.sort(key=lambda r: r.get("tag_old", ""))
+    # 按 tag 排序，顺序稳定，避免每次提交产生无意义 diff
+    rows.sort(key=lambda r: r.get("tag", ""))
     return rows
 
 
 def render(rows: list[dict]) -> list[str]:
     lines = [
         f"{BEGIN} 本块由构建工作流自动重写，不要手工编辑 -->",
-        "| 规范 tag | 历史 tag（保留为别名） | 镜像内 `java -version` |",
-        "|---|---|---|",
+        "| 镜像 tag | 镜像内 `java -version` |",
+        "|---|---|",
     ]
     for r in rows:
-        tag_new = r.get("tag_new") or "-"
-        tag_old = r.get("tag_old") or "-"
+        tag = r.get("tag") or "-"
         java_ver = r.get("java_version") or "-"
-        lines.append(f"| `{tag_new}` | `{tag_old}` | `{java_ver}` |")
+        lines.append(f"| `{tag}` | `{java_ver}` |")
     lines.append(END)
     return lines
 

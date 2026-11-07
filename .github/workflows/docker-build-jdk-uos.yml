@@ -94,8 +94,8 @@ jobs:
 
           # 变体注册表从 .github/variants.txt 读取（构建与验证两个 workflow 共用同一份，
           # 避免各维护一份导致不同步）。字段含义见该文件头部注释。
-          # 镜像 tag 一列是历史 tag（兼容用），新 tag 由 make_tag 按
-          # 「系统-系统版本-发行版-JDK版本[-特性]」生成，两者构建时同时推送。
+          # 第 3 列只是变体标识，用于矩阵去重与 job 名；镜像 tag 由 make_tag 按
+          # 「系统-系统版本-发行版-JDK版本[-特性]」生成，每个变体只推这一个。
           mapfile -t VARIANTS < <(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt)
           if [ "${#VARIANTS[@]}" -eq 0 ]; then
             echo "::error::未读到任何变体，检查 .github/variants.txt" >&2
@@ -125,18 +125,49 @@ jobs:
             sed -i -E "s|^(ARG[[:space:]]+${name}=)[^ #]+|\1${quoted}|" "$file"
           }
 
-          # 按「系统-系统版本-发行版-JDK版本[-特性]」拼新 tag。
-          # Dragonwell / Temurin 是自己下载的，版本由 Dockerfile 的 ARG 决定，构建前就能算出 tag。
-          # OpenJDK 变体的版本由 UOS 仓库决定，构建前不知道，这里返回空，
-          # 由 build-push job 构建完从镜像里读出实际版本再补打规范 tag。
+          # 查 UOS 仓库里 java-*-openjdk-devel 的当前版本。
+          # OpenJDK 变体的版本由仓库决定，构建前只能进基础镜像问 yum，否则算不出 tag。
+          # 结果按包名缓存，jdk17 与 jdk17-ffmpeg 共用一次查询。
+          UOS_BASE_IMAGE="${UOS_BASE_IMAGE:-ghcr.io/blueapple168/uos-server-20-1070a:latest}"
+          declare -A UOS_VER_CACHE=()
+          uos_jdk_version() {   # $1=包名，如 java-17-openjdk-devel
+            local pkg="$1" ver=""
+            if [ -n "${UOS_VER_CACHE[$pkg]:-}" ]; then
+              printf '%s' "${UOS_VER_CACHE[$pkg]}"
+              return 0
+            fi
+            docker pull -q "${UOS_BASE_IMAGE}" >/dev/null 2>&1 || {
+              echo "::error::拉取基础镜像失败: ${UOS_BASE_IMAGE}" >&2; return 1; }
+            ver="$(docker run --rm --entrypoint sh "${UOS_BASE_IMAGE}" -c "
+              sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo 2>/dev/null || true
+              yum makecache -q >/dev/null 2>&1 || true
+              yum list available ${pkg} 2>/dev/null | awk '/^${pkg}/{print \$2}' | tail -n1
+            " | tr -d '\r\n')"
+            if [ -z "$ver" ]; then
+              echo "::error::未能从 UOS 仓库查到 ${pkg} 的版本" >&2
+              return 1
+            fi
+            UOS_VER_CACHE[$pkg]="$ver"
+            printf '%s' "$ver"
+          }
+
+          # 按「系统-系统版本-发行版-JDK版本[-特性]」拼 tag，这是镜像唯一的 tag。
+          # Dragonwell / Temurin 的版本来自 Dockerfile ARG；
+          # OpenJDK 的版本进 UOS 基础镜像问 yum 得到（与构建时 yum install 装到的版本一致）。
           # Docker tag 不允许 +，统一换成 -。
           make_tag() {
             local dir="$1" df="$2" v_os="$3" v_osver="$4" v_vendor="$5" v_flavor="$6"
             local jdkver=""
             case "$v_vendor" in
               openjdk)
-                # 留空 = 待构建后确定
-                return 0 ;;
+                local pkg
+                pkg="$(grep -oE 'java-[0-9.]+-openjdk-devel' "${dir}/${df}" | head -n1)"
+                if [ -z "$pkg" ]; then
+                  echo "::error::${dir}/${df}: 找不到 java-*-openjdk-devel 包名" >&2
+                  return 1
+                fi
+                jdkver="$(uos_jdk_version "$pkg")" || return 1
+                ;;
               dragonwell) jdkver="$(get_arg "${dir}/${df}" DRAGONWELL_RAW)" ;;
               temurin)    jdkver="$(get_arg "${dir}/${df}" JDKVER_RAW)" ;;
               *) echo "::error::${dir}/${df}: 未知发行版 ${v_vendor}" >&2; return 1 ;;
@@ -520,19 +551,17 @@ jobs:
         id: meta
         run: |
           set -eux
-          # 历史 tag：构建时先推这个，OpenJDK 变体要靠它读实际版本
-          TAG_OLD="${{ matrix.tag }}"
-          test -n "$TAG_OLD"
-          # 规范 tag：Dragonwell/Temurin 构建前已确定；OpenJDK 为空，构建后补
+          # 镜像只有一个 tag：系统-系统版本-发行版-JDK版本[-特性]
+          # 不再推历史 tag，也不推 <tag>-<sha>，避免仓库里堆一堆带 sha 的条目
           TAG_NEW="${{ matrix.tag_new }}"
+          test -n "$TAG_NEW"
           REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           IMAGE="${REGISTRY}/${REPO}"
           {
             echo "image=${IMAGE}"
-            echo "tag_old=${TAG_OLD}"
             echo "tag_new=${TAG_NEW}"
-            echo "tags=${IMAGE}:${TAG_OLD},${IMAGE}:${TAG_OLD}-${GITHUB_SHA::7}"
-            # cache scope 用变体短名，与 tag 命名规则解耦
+            echo "tags=${IMAGE}:${TAG_NEW}"
+            # cache scope 用变体标识，与 tag 命名规则解耦
             echo "scope=${{ matrix.variant }}"
           } >> "$GITHUB_OUTPUT"
 
@@ -543,6 +572,11 @@ jobs:
           file: ${{ env.BUILD_DIR }}/${{ matrix.dockerfile }}
           platforms: ${{ env.PLATFORMS }}
           push: true
+          # 关掉 provenance 与 SBOM：它们会给每个 tag 额外挂两个 unknown/unknown 的
+          # attestation manifest，在 GHCR 页面上显示成一堆 sha256:xxx 条目。
+          # 这里不需要签名溯源信息，关掉后 manifest 只剩 amd64 + arm64 两项。
+          provenance: false
+          sbom: false
           # 组件版本经 build-arg 传入，取自矩阵（即 Dockerfile 当前 ARG 值）
           build-args: |
             DUMB_INIT_VER=${{ matrix.dumb_init_ver }}
@@ -555,61 +589,54 @@ jobs:
           cache-from: type=gha,scope=jdk-${{ steps.meta.outputs.scope }}
           cache-to: type=gha,scope=jdk-${{ steps.meta.outputs.scope }},mode=max
 
-      - name: 补打规范 tag (系统-系统版本-发行版-JDK版本)
-        id: retag
+      - name: 校验镜像内 JDK 版本与 tag 一致
+        id: verify
         run: |
           set -eux
           IMAGE="${{ steps.meta.outputs.image }}"
-          TAG_OLD="${{ steps.meta.outputs.tag_old }}"
           TAG_NEW="${{ steps.meta.outputs.tag_new }}"
           VENDOR="${{ matrix.vendor }}"
+          FLAVOR="${{ matrix.flavor }}"
 
-          if [ -z "$TAG_NEW" ]; then
-            # OpenJDK 变体：版本由 UOS 仓库决定，从构建产物里读实际装上的 NEVRA。
-            # 用 --entrypoint sh 跳过 dumb-init/entrypoint，避免走到应用启动逻辑。
-            docker pull --platform linux/amd64 "${IMAGE}:${TAG_OLD}"
-            JDKVER="$(docker run --rm --platform linux/amd64 --entrypoint sh "${IMAGE}:${TAG_OLD}" \
-              -c 'PKG="$(rpm -qa | grep -- -openjdk-devel | head -1)"; rpm -q --qf "%{VERSION}-%{RELEASE}" "$PKG"')"
-            JDKVER="$(printf '%s' "$JDKVER" | tr -d '\r\n')"
-            if [ -z "$JDKVER" ]; then
-              echo "::error::未能从镜像读出 openjdk-devel 版本，无法生成规范 tag" >&2
+          # tag 里的版本段（去掉 flavor 后缀）
+          TAG_VER="${TAG_NEW#${{ matrix.os }}-${{ matrix.osver }}-${VENDOR}-}"
+          if [ -n "$FLAVOR" ]; then
+            TAG_VER="${TAG_VER%-${FLAVOR}}"
+          fi
+
+          # 用 --entrypoint sh 跳过 dumb-init/entrypoint，避免走到应用启动逻辑
+          docker pull -q --platform linux/amd64 "${IMAGE}:${TAG_NEW}"
+
+          if [ "$VENDOR" = "openjdk" ]; then
+            # OpenJDK：tag 里的版本来自构建前查的 yum 仓库，这里复核镜像里真装上的 NEVRA，
+            # 防止查询与安装之间仓库发生更新，导致 tag 与内容不符
+            ACTUAL="$(docker run --rm --platform linux/amd64 --entrypoint sh "${IMAGE}:${TAG_NEW}" \
+              -c 'PKG="$(rpm -qa | grep -- -openjdk-devel | head -1)"; rpm -q --qf "%{VERSION}-%{RELEASE}" "$PKG"' \
+              | tr -d '\r\n')"
+            if [ "$ACTUAL" != "$TAG_VER" ]; then
+              echo "::error::tag 承诺 ${TAG_VER}，镜像内实际 ${ACTUAL}（仓库在查询与安装之间变更？）" >&2
               exit 1
             fi
-            echo "==> 镜像内实际 JDK 版本: ${JDKVER}"
-            TAG_NEW="${{ matrix.os }}-${{ matrix.osver }}-${VENDOR}-${JDKVER}"
-            FLAVOR="${{ matrix.flavor }}"
-            if [ -n "$FLAVOR" ]; then
-              TAG_NEW="${TAG_NEW}-${FLAVOR}"
-            fi
+            echo "==> 版本复核通过: ${ACTUAL}"
           else
-            echo "==> 规范 tag 由 Dockerfile ARG 决定: ${TAG_NEW}"
+            echo "==> 版本由 Dockerfile ARG 决定: ${TAG_VER}"
           fi
 
-          # imagetools create 只给已有 manifest 加 tag，不重建、不重复推层
-          docker buildx imagetools create -t "${IMAGE}:${TAG_NEW}" "${IMAGE}:${TAG_OLD}"
-          echo "tag_new=${TAG_NEW}" >> "$GITHUB_OUTPUT"
-
-          # 读镜像内真实 java 版本，写进产物供 README 版本表使用。
-          # openjdk 分支已 pull 过；其他变体这里补一次 pull。
-          if [ "$VENDOR" != "openjdk" ]; then
-            docker pull -q --platform linux/amd64 "${IMAGE}:${TAG_OLD}"
-          fi
-          JAVA_VER="$(docker run --rm --platform linux/amd64 --entrypoint sh "${IMAGE}:${TAG_OLD}" \
-            -c 'java -version 2>&1 | sed -n "1s/.*version \"\([^\"]*\)\".*/\1/p"')"
-          JAVA_VER="$(printf '%s' "$JAVA_VER" | tr -d '\r\n')"
+          JAVA_VER="$(docker run --rm --platform linux/amd64 --entrypoint sh "${IMAGE}:${TAG_NEW}" \
+            -c 'java -version 2>&1 | sed -n "1s/.*version \"\([^\"]*\)\".*/\1/p"' | tr -d '\r\n')"
           echo "==> 镜像内 java -version: ${JAVA_VER:-读不到}"
 
           mkdir -p out
-          printf '{"variant":"%s","dir":"%s","tag_old":"%s","tag_new":"%s","java_version":"%s"}\n' \
-            "${{ matrix.variant }}" "${{ matrix.dir }}" "${TAG_OLD}" "${TAG_NEW}" "${JAVA_VER}" \
+          printf '{"variant":"%s","dir":"%s","tag":"%s","java_version":"%s"}\n' \
+            "${{ matrix.variant }}" "${{ matrix.dir }}" "${TAG_NEW}" "${JAVA_VER}" \
             > "out/${{ matrix.dir }}-${{ matrix.dockerfile }}.json"
 
           {
             echo "### 已推送 (${{ matrix.variant }})"
             echo ""
-            echo "| 规范 tag | 历史 tag | java -version |"
-            echo "|---|---|---|"
-            echo "| \`${TAG_NEW}\` | \`${TAG_OLD}\` | \`${JAVA_VER:-?}\` |"
+            echo "| tag | java -version |"
+            echo "|---|---|"
+            echo "| \`${TAG_NEW}\` | \`${JAVA_VER:-?}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传 tag 与版本信息
@@ -620,14 +647,26 @@ jobs:
           path: out/*.json
           if-no-files-found: warn
 
-      - name: 校验 manifest 包含两个架构
+      - name: 校验 manifest 只有 amd64 + arm64 两个架构
         run: |
           set -eux
           IMAGE="${{ steps.meta.outputs.image }}"
-          for t in "${{ steps.retag.outputs.tag_new }}" "${{ steps.meta.outputs.tag_old }}"; do
-            echo "--- ${t} ---"
-            docker buildx imagetools inspect "${IMAGE}:${t}"
-          done
+          TAG_NEW="${{ steps.meta.outputs.tag_new }}"
+          docker buildx imagetools inspect "${IMAGE}:${TAG_NEW}"
+
+          # 关掉 provenance/sbom 后不该再有 unknown/unknown 的 attestation；
+          # 万一又出现，这里直接拦下，避免 GHCR 上又堆一堆 sha256 条目
+          REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          GHCR_TOKEN="$(curl -fsS "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" | jq -r .token)"
+          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json"
+          PLATFORMS_FOUND="$(curl -fsSL -H "Authorization: Bearer ${GHCR_TOKEN}" -H "Accept: ${ACCEPT}" \
+            "https://ghcr.io/v2/${REPO}/manifests/${TAG_NEW}" \
+            | jq -r '[.manifests[]?.platform | "\(.os)/\(.architecture)"] | sort | join(",")')"
+          echo "==> manifest 平台: ${PLATFORMS_FOUND}"
+          if [ "$PLATFORMS_FOUND" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::manifest 平台不符，期望 linux/amd64,linux/arm64，实际 ${PLATFORMS_FOUND}" >&2
+            exit 1
+          fi
 
   # 所有变体构建完后，把最新的 tag 与 JDK 版本写回 README。
   # 单独一个 job 而不是在 build-push 里各写各的：并发写同一文件必然冲突。

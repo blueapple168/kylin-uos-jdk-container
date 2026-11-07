@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       variant:
-        description: "只验证指定变体（填历史 tag 或规范 tag，如 jdk17 / uos-20-1070a-openjdk-17.0.9.0.9-2.0.2；留空验证全部）"
+        description: "只验证指定变体（填完整 tag，如 uos-20-1070a-openjdk-17.0.9.0.9-2.0.2；留空验证全部）"
         required: false
         default: ""
       platforms:
@@ -69,24 +69,36 @@ jobs:
               | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/'
           }
 
-          # 按「系统-系统版本-发行版-JDK版本[-特性]」拼规范 tag，与构建 workflow 一致
-          make_tag() {
-            local dir="$1" df="$2" v_os="$3" v_osver="$4" v_vendor="$5" v_flavor="$6"
-            local jdkver=""
-            case "$v_vendor" in
-              # OpenJDK 版本由 UOS 仓库决定，构建后才确定，这里留空
-              openjdk)    jdkver="" ;;
-              dragonwell) jdkver="$(get_arg "${dir}/${df}" DRAGONWELL_RAW)" ;;
-              temurin)    jdkver="$(get_arg "${dir}/${df}" JDKVER_RAW)" ;;
-            esac
-            if [ -z "$jdkver" ] && [ "$v_vendor" != "openjdk" ]; then
-              echo "::error::${dir}/${df}: 解析不到 JDK 版本" >&2
-              return 1
-            fi
-            jdkver="${jdkver//+/-}"
-            local t="${v_os}-${v_osver}-${v_vendor}-${jdkver}"
-            [ -n "$v_flavor" ] && t="${t}-${v_flavor}"
-            printf '%s' "$t"
+          # 镜像只有一个规范 tag，所以直接去 registry 拉 tag 列表，按前缀 + 特性后缀筛。
+          # OpenJDK 的版本段由仓库决定，本地算不出来，只能这样反查。
+          REPO="$(echo '${{ github.repository }}' | tr 'A-Z' 'a-z')"
+          GHCR_TOKEN="$(curl -fsS "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" | jq -r .token)"
+          ALL_TAGS="$(curl -fsS -H "Authorization: Bearer ${GHCR_TOKEN}" \
+            "https://ghcr.io/v2/${REPO}/tags/list" | jq -r '.tags[]?')"
+          echo "registry 上共 $(printf '%s\n' "$ALL_TAGS" | grep -c . || true) 个 tag"
+
+          # 所有特性后缀（如 ffmpeg），用于把「无特性」变体与「带特性」变体区分开
+          KNOWN_FLAVORS="$(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt \
+            | awk -F'|' '$9 != "" {print $9}' | sort -u | tr '\n' ' ')"
+
+          # $1=os $2=osver $3=vendor $4=flavor，输出匹配的规范 tag（多个取版本最大）
+          pick_tag() {
+            local prefix="$1-$2-$3-" cand t f skip
+            cand="$(printf '%s\n' "$ALL_TAGS" | grep -F "$prefix" | grep -v '^$' || true)"
+            [ -n "$cand" ] || return 1
+            while IFS= read -r t; do
+              [ -n "$t" ] || continue
+              if [ -n "$4" ]; then
+                case "$t" in *"-$4") printf '%s' "$t"; return 0 ;; esac
+              else
+                skip=0
+                for f in $KNOWN_FLAVORS; do
+                  case "$t" in *"-$f") skip=1; break ;; esac
+                done
+                [ "$skip" = "0" ] && { printf '%s' "$t"; return 0; }
+              fi
+            done < <(printf '%s\n' "$cand" | sort -V -r)
+            return 1
           }
 
           # 期望 JDK 版本要原样传给容器内脚本（保留 +，脚本自己判主版本）
@@ -101,12 +113,18 @@ jobs:
           }
 
           matrix_arr=()
-          while IFS='|' read -r dir df tag_old short dwsrc v_os v_osver v_vendor v_flavor; do
+          while IFS='|' read -r dir df tag_id short dwsrc v_os v_osver v_vendor v_flavor; do
             [ -n "$dir" ] || continue
             [ -f "${dir}/${df}" ] || { echo "::warning::跳过不存在的 ${dir}/${df}"; continue; }
-            # 规范 tag 可能还没补上（OpenJDK 要构建后才知道版本），所以验证统一用历史 tag 拉镜像，
-            # 它一定存在且指向最新构建产物
-            if [ -n "$WANT" ] && [ "$WANT" != "$tag_old" ]; then
+
+            # 从 registry 反查该变体的规范 tag；查不到说明还没构建过，跳过并提示
+            if ! tag="$(pick_tag "$v_os" "$v_osver" "$v_vendor" "$v_flavor")"; then
+              echo "::warning::${dir}/${df}: registry 上找不到 ${v_os}-${v_osver}-${v_vendor}-* 的 tag，跳过"
+              continue
+            fi
+
+            # 手工指定变体时按变体标识或完整 tag 过滤
+            if [ -n "$WANT" ] && [ "$WANT" != "$tag_id" ] && [ "$WANT" != "$tag" ]; then
               continue
             fi
 
@@ -115,7 +133,7 @@ jobs:
             echo "$PLATS" | tr ',' '\n' | while read -r plat; do
               [ -n "$plat" ] || continue
               arch="${plat##*/}"
-              printf '%s\n' "{\"tag\":\"${tag_old}\",\"arch\":\"${arch}\",\"platform\":\"${plat}\",\"os\":\"${v_os}\",\"osver\":\"${v_osver}\",\"vendor\":\"${v_vendor}\",\"jdkver\":\"${jdk_ver}\",\"flavor\":\"${v_flavor}\"}"
+              printf '%s\n' "{\"tag\":\"${tag}\",\"arch\":\"${arch}\",\"platform\":\"${plat}\",\"os\":\"${v_os}\",\"osver\":\"${v_osver}\",\"vendor\":\"${v_vendor}\",\"jdkver\":\"${jdk_ver}\",\"flavor\":\"${v_flavor}\"}"
             done >> /tmp/rows.txt
           done < <(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt)
 
@@ -274,83 +292,86 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 逐个变体比对
+      - name: 校验 tag 集合与 manifest 平台
         run: |
           set -eux
           REPO="$(echo '${{ github.repository }}' | tr 'A-Z' 'a-z')"
-          IMAGE="${REGISTRY}/${REPO}"
-          # 直接用 registry API 取 manifest digest，比 buildx inspect 的模板更稳
           GHCR_TOKEN="$(curl -fsS "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" | jq -r .token)"
-          # 必须同时接受 index 和单架构 manifest：查 tag 返回 index，
-          # 查子 manifest 返回单架构；少了后者会 404
-          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
-          digest_of() {
-            curl -fsSI -H "Authorization: Bearer ${GHCR_TOKEN}" -H "Accept: ${ACCEPT}" \
-              "https://ghcr.io/v2/${REPO}/manifests/$1" \
-              | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'
-          }
+          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json"
+
+          ALL_TAGS="$(curl -fsS -H "Authorization: Bearer ${GHCR_TOKEN}" \
+            "https://ghcr.io/v2/${REPO}/tags/list" | jq -r '.tags[]?' | sort)"
+          KNOWN_FLAVORS="$(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt \
+            | awk -F'|' '$9 != "" {print $9}' | sort -u | tr '\n' ' ')"
 
           fails=0
           rows=""
+          expected=""
 
-          while IFS='|' read -r dir df tag_old short dwsrc v_os v_osver v_vendor v_flavor; do
+          while IFS='|' read -r dir df tag_id short dwsrc v_os v_osver v_vendor v_flavor; do
             [ -n "$dir" ] || continue
             [ -f "${dir}/${df}" ] || continue
+            prefix="${v_os}-${v_osver}-${v_vendor}-"
 
-            # 期望的 JDK 版本：Dragonwell/Temurin 来自 Dockerfile ARG；
-            # OpenJDK 来自仓库，只能拉镜像进容器读实际装上的 NEVRA
-            case "$v_vendor" in
-              openjdk)
-                docker pull -q --platform linux/amd64 "${IMAGE}:${tag_old}"
-                jdkver="$(docker run --rm --platform linux/amd64 --entrypoint sh "${IMAGE}:${tag_old}" \
-                  -c 'PKG="$(rpm -qa | grep -- -openjdk-devel | head -1)"; rpm -q --qf "%{VERSION}-%{RELEASE}" "$PKG"')"
-                jdkver="$(printf '%s' "$jdkver" | tr -d '\r\n')"
-                ;;
-              dragonwell)
-                jdkver="$(sed -nE 's/^ARG[[:space:]]+DRAGONWELL_RAW=([^ #]+).*/\1/p' "${dir}/${df}" | head -n1 | tr -d '"')"
-                ;;
-              temurin)
-                jdkver="$(sed -nE 's/^ARG[[:space:]]+JDKVER_RAW=([^ #]+).*/\1/p' "${dir}/${df}" | head -n1 | tr -d '"')"
-                ;;
-            esac
-            jdkver="${jdkver//+/-}"
-            if [ -z "$jdkver" ]; then
-              echo "::error::${dir}/${df}: 取不到 JDK 版本，无法推导规范 tag"
+            # 该变体应有的 tag：前缀匹配 + 特性后缀匹配
+            hit=""
+            while IFS= read -r t; do
+              [ -n "$t" ] || continue
+              case "$t" in "$prefix"*) ;; *) continue ;; esac
+              if [ -n "$v_flavor" ]; then
+                case "$t" in *"-$v_flavor") hit="$t" ;; esac
+              else
+                skip=0
+                for f in $KNOWN_FLAVORS; do
+                  case "$t" in *"-$f") skip=1; break ;; esac
+                done
+                [ "$skip" = "0" ] && hit="$t"
+              fi
+            done <<< "$ALL_TAGS"
+
+            if [ -z "$hit" ]; then
+              echo "::error::${dir}/${df}: registry 上找不到 ${prefix}* 的 tag"
               fails=$((fails + 1))
+              rows="${rows}| \`${dir}/${df}\` | - | ❌ 缺 tag |"$'\n'
               continue
             fi
+            expected="${expected}${hit}"$'\n'
 
-            expect="${v_os}-${v_osver}-${v_vendor}-${jdkver}"
-            [ -n "$v_flavor" ] && expect="${expect}-${v_flavor}"
-
-            d_new="$(digest_of "${expect}" || true)"
-            if [ -z "$d_new" ]; then
-              echo "::error::规范 tag 不存在: ${expect}（历史 tag ${tag_old}）"
-              fails=$((fails + 1))
-              rows="${rows}| \`${tag_old}\` | \`${expect}\` | ❌ 不存在 |"$'\n'
-              continue
-            fi
-            d_old="$(digest_of "${tag_old}" || true)"
-            if [ "$d_new" = "$d_old" ]; then
-              echo "PASS ${tag_old} -> ${expect}  ${d_new:0:26}"
-              rows="${rows}| \`${tag_old}\` | \`${expect}\` | ✅ digest 一致 |"$'\n'
+            # manifest 必须只有 amd64 + arm64，不能有 unknown/unknown 的 attestation
+            plats="$(curl -fsSL -H "Authorization: Bearer ${GHCR_TOKEN}" -H "Accept: ${ACCEPT}" \
+              "https://ghcr.io/v2/${REPO}/manifests/${hit}" \
+              | jq -r '[.manifests[]?.platform | "\(.os)/\(.architecture)"] | sort | join(",")')"
+            if [ "$plats" = "linux/amd64,linux/arm64" ]; then
+              echo "PASS ${hit}  platforms=${plats}"
+              rows="${rows}| \`${hit}\` | ${plats} | ✅ |"$'\n'
             else
-              echo "::error::digest 不一致 ${tag_old}=${d_old:0:26} vs ${expect}=${d_new:0:26}"
+              echo "::error::${hit}: manifest 平台为 ${plats}，期望 linux/amd64,linux/arm64"
               fails=$((fails + 1))
-              rows="${rows}| \`${tag_old}\` | \`${expect}\` | ❌ digest 不一致 |"$'\n'
+              rows="${rows}| \`${hit}\` | ${plats} | ❌ 平台不符 |"$'\n'
             fi
           done < <(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt)
 
+          # registry 上不该有别的 tag（历史 tag、<tag>-<sha> 之类都算多余）
+          extra="$(comm -23 <(printf '%s\n' "$ALL_TAGS") <(printf '%s' "$expected" | sort -u) | grep -v '^$' || true)"
+          if [ -n "$extra" ]; then
+            echo "::error::registry 上存在多余 tag:"
+            printf '  %s\n' $extra
+            fails=$((fails + 1))
+            rows="${rows}| （多余 tag） | $(printf '%s ' $extra) | ❌ 应删除 |"$'\n'
+          fi
+
           {
-            echo "### 规范 tag 一致性"
+            echo "### tag 与 manifest 校验"
             echo ""
-            echo "| 历史 tag | 规范 tag | 结果 |"
+            echo "| tag | manifest 平台 | 结果 |"
             echo "|---|---|---|"
             printf '%s' "$rows"
+            echo ""
+            echo "registry 上共 $(printf '%s\n' "$ALL_TAGS" | grep -c . || true) 个 tag，期望 $(printf '%s' "$expected" | grep -c . || true) 个"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$fails" -gt 0 ]; then
-            echo "::error::${fails} 个变体的规范 tag 与镜像不一致"
+            echo "::error::tag 集合或 manifest 平台校验失败（${fails} 处）"
             exit 1
           fi
 

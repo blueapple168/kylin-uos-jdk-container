@@ -53,13 +53,42 @@ get_arg() {
         | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/'
 }
 
-# 按「系统-系统版本-发行版-JDK版本[-特性]」拼规范 tag。Docker tag 不允许 +，换成 -
-# OpenJDK 变体返回空：版本由 UOS 仓库决定，只能构建完从镜像里读，见 build_one
+# 查 UOS 仓库里 java-*-openjdk-devel 的当前版本。
+# OpenJDK 变体的版本由仓库决定，构建前只能进基础镜像问 yum，否则算不出 tag。
+UOS_BASE_IMAGE="${UOS_BASE_IMAGE:-ghcr.io/blueapple168/uos-server-20-1070a:latest}"
+declare -A UOS_VER_CACHE=()
+uos_jdk_version() {   # $1=包名，如 java-17-openjdk-devel
+    local pkg="$1" ver=""
+    if [[ -n "${UOS_VER_CACHE[$pkg]:-}" ]]; then
+        printf '%s' "${UOS_VER_CACHE[$pkg]}"
+        return 0
+    fi
+    docker pull -q "${UOS_BASE_IMAGE}" >/dev/null 2>&1 || {
+        echo "拉取基础镜像失败: ${UOS_BASE_IMAGE}" >&2; return 1; }
+    ver="$(docker run --rm --entrypoint sh "${UOS_BASE_IMAGE}" -c "
+        sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo 2>/dev/null || true
+        yum makecache -q >/dev/null 2>&1 || true
+        yum list available ${pkg} 2>/dev/null | awk '/^${pkg}/{print \$2}' | tail -n1
+    " | tr -d '\r\n')"
+    [[ -n "${ver}" ]] || { echo "查不到 ${pkg} 的版本" >&2; return 1; }
+    UOS_VER_CACHE[$pkg]="${ver}"
+    printf '%s' "${ver}"
+}
+
+# 按「系统-系统版本-发行版-JDK版本[-特性]」拼 tag，这是镜像唯一的 tag。
+# Dragonwell / Temurin 的版本来自 Dockerfile ARG；
+# OpenJDK 的版本进 UOS 基础镜像问 yum 得到（与构建时 yum install 装到的版本一致）。
+# Docker tag 不允许 +，换成 -
 make_tag() {
     local dir="$1" df="$2" os="$3" osver="$4" vendor="$5" flavor="$6"
     local jdkver=""
     case "${vendor}" in
-        openjdk)    return 0 ;;
+        openjdk)
+            local pkg
+            pkg="$(grep -oE 'java-[0-9.]+-openjdk-devel' "${dir}/${df}" | head -n1)"
+            [[ -n "${pkg}" ]] || { echo "找不到 java-*-openjdk-devel 包名: ${dir}/${df}" >&2; return 1; }
+            jdkver="$(uos_jdk_version "${pkg}")" || return 1
+            ;;
         dragonwell) jdkver="$(get_arg "${dir}/${df}" DRAGONWELL_RAW)" ;;
         temurin)    jdkver="$(get_arg "${dir}/${df}" JDKVER_RAW)" ;;
         *) echo "unknown vendor: ${vendor}" >&2; return 1 ;;
@@ -85,26 +114,26 @@ pick_variants() {
 }
 
 build_one() {
-    local dir="$1" df="$2" suffix="$3" new_tag="$4"
-    local tag_old="${IMAGE_PREFIX}:${suffix}"
-    local tag_new=""
-    [[ -n "${new_tag}" ]] && tag_new="${IMAGE_PREFIX}:${new_tag}"
+    local dir="$1" df="$2" suffix="$3" tag_name="$4"
+    [[ -n "${tag_name}" ]] || { echo "缺少规范 tag: ${dir}/${df}" >&2; return 1; }
 
     # --load 只能加载单个平台，剥离多平台列表
     local platforms="${PLATFORMS}"
     [[ "${LOAD}" == "1" ]] && platforms="${PLATFORMS%%,*}"
 
+    # 镜像只打一个 tag：系统-系统版本-发行版-JDK版本[-特性]
+    # --provenance=false --sbom=false：否则每个 tag 会多挂两个 unknown/unknown 的
+    # attestation manifest，在 registry 页面上显示成一堆 sha256 条目
     local cmd=(docker buildx build
         --file "${dir}/${df}"
         --platform "${platforms}"
-        --tag "${tag_old}"
+        --tag "${IMAGE_PREFIX}:${tag_name}"
+        --provenance=false
+        --sbom=false
         --build-arg "DUMB_INIT_VER=${DUMB_INIT_VER:-1.2.5}"
         --build-arg "GOSU_VER=${GOSU_VER:-1.20}"
         --build-arg "OTEL_AGENT_VER=${OTEL_AGENT_VER:-2.33.1}"
-        --label "org.opencontainers.image.revision=jdk-${suffix}"
     )
-    # 规范 tag 已知就直接一起打上；OpenJDK 要等构建完读出版本再补
-    [[ -n "${tag_new}" ]] && cmd+=(--tag "${tag_new}")
 
     if [[ -n "${MIRROR_GITHUB:-}" ]]; then
         cmd+=(--build-arg "MIRROR_GITHUB=${MIRROR_GITHUB}")
@@ -122,47 +151,14 @@ build_one() {
         cmd+=(--push)
     fi
 
-    if [[ "${IMAGE_TAG}" != "latest" ]]; then
-        cmd+=(--tag "${IMAGE_PREFIX}:${suffix}-${IMAGE_TAG}")
-    fi
-
     cmd+=("${dir}")
 
     echo "------------------------------------------------------------"
     echo ">>> ${suffix}  (${dir}/${df})"
-    echo ">>> 规范 tag: ${new_tag:-构建后按仓库实际版本确定}"
+    echo ">>> tag: ${tag_name}"
     echo ">>> platforms: ${platforms}"
     echo "------------------------------------------------------------"
     "${cmd[@]}"
-
-    # OpenJDK 变体：版本由 UOS 仓库决定，构建完从镜像里读出实际 NEVRA 再补打规范 tag
-    if [[ -z "${new_tag}" ]]; then
-        local probe=""
-        if [[ "${LOAD}" == "1" || "${NO_PUSH}" == "1" ]]; then
-            probe="${tag_old}"
-        else
-            docker pull -q --platform "${platforms%%,*}" "${tag_old}"
-            probe="${tag_old}"
-        fi
-        local jv
-        jv="$(docker run --rm --platform "${platforms%%,*}" --entrypoint sh "${probe}" \
-            -c 'PKG="$(rpm -qa | grep -- -openjdk-devel | head -1)"; rpm -q --qf "%{VERSION}-%{RELEASE}" "$PKG"' | tr -d '\r\n')"
-        if [[ -n "${jv}" ]]; then
-            local v_os v_osver v_vendor v_flavor
-            IFS='|' read -r _ _ _ _ v_os v_osver v_vendor v_flavor <<< "$(printf '%s\n' "${ALL_VARIANTS[@]}" | grep -F "|${suffix}|" | head -n1)"
-            new_tag="${v_os}-${v_osver}-${v_vendor}-${jv}"
-            [[ -n "${v_flavor}" ]] && new_tag="${new_tag}-${v_flavor}"
-            echo ">>> 镜像内实际 JDK 版本: ${jv}"
-            echo ">>> 规范 tag: ${new_tag}"
-            if [[ "${PUSH}" == "1" && "${NO_PUSH}" == "0" ]]; then
-                docker buildx imagetools create -t "${IMAGE_PREFIX}:${new_tag}" "${tag_old}"
-            else
-                docker tag "${tag_old}" "${IMAGE_PREFIX}:${new_tag}"
-            fi
-        else
-            echo ">>> 警告: 读不到 JDK 版本，跳过规范 tag" >&2
-        fi
-    fi
 }
 
 mapfile -t VARIANTS < <(pick_variants "${ARGS[0]:-}" "${ARGS[1]:-}")
@@ -181,10 +177,6 @@ echo
 echo "完成。查看 manifest："
 for v in "${VARIANTS[@]}"; do
     IFS='|' read -r dir df suffix short v_os v_osver v_vendor v_flavor <<< "${v}"
-    new_tag="$(make_tag "${dir}" "${df}" "${v_os}" "${v_osver}" "${v_vendor}" "${v_flavor}")"
-    if [[ -n "${new_tag}" ]]; then
-        echo "  docker buildx imagetools inspect ${IMAGE_PREFIX}:${new_tag}"
-    else
-        echo "  ${suffix}: 规范 tag 已按构建时的仓库版本补打，见上方输出"
-    fi
+    tag="$(make_tag "${dir}" "${df}" "${v_os}" "${v_osver}" "${v_vendor}" "${v_flavor}")"
+    echo "  docker buildx imagetools inspect ${IMAGE_PREFIX}:${tag}"
 done

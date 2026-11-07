@@ -47,27 +47,34 @@
 
 ## 镜像 tag 命名
 
-规范格式：`{系统}-{系统版本}-{发行版}-{JDK版本}[-{特性}]`
+格式：`{系统}-{系统版本}-{发行版}-{JDK版本}[-{特性}]`
 
-- Dragonwell / Temurin 的版本取自 Dockerfile 的 ARG（`DRAGONWELL_RAW` / `JDKVER_RAW`），构建前即可算出 tag
-- OpenJDK 变体的版本由 UOS 仓库决定，构建后从镜像读实际 NEVRA 再补打 tag，**tag 承诺什么版本，镜像里就是什么版本**
+每个变体**只产出一个 tag**。不推历史短名（`jdk8` 之类），也不推 `<tag>-<sha>`，
+registry 上就是下面这 10 条，干净可枚举。
+
+- Dragonwell / Temurin 的版本取自 Dockerfile 的 ARG（`DRAGONWELL_RAW` / `JDKVER_RAW`）
+- OpenJDK 的版本由 UOS 仓库决定：构建前进基础镜像问 `yum list available`，
+  装完再复核镜像里的 NEVRA，两者不符直接失败，**tag 承诺什么版本，镜像里就是什么版本**
 - Docker tag 不允许 `+`，一律替换为 `-`（如 `25.0.5+8` → `25.0.5-8`）
 - `-{特性}` 仅用于区分同系统同 JDK 的功能变体（如 `-ffmpeg`）
 - 变体清单集中维护在 `.github/variants.txt`，构建与验证两个工作流共用
 
+构建时关闭了 buildx 的 provenance 与 SBOM，否则每个 tag 会额外挂两个
+`unknown/unknown` 的 attestation manifest，在 registry 页面上显示成一堆 `sha256:xxx` 条目。
+
 <!-- VERSIONS:BEGIN 本块由构建工作流自动重写，不要手工编辑 -->
-| 规范 tag | 历史 tag（保留为别名） | 镜像内 `java -version` |
-|---|---|---|
-| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2.uelc20.01` | `jdk17` | `17.0.9` |
-| `uos-20-1070a-dragonwell-17.0.20.0.21-8-standard` | `jdk17-dragonwell` | `17.0.20` |
-| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2.uelc20.01-ffmpeg` | `jdk17-ffmpeg` | `17.0.9` |
-| `uos-20-1070a-dragonwell-21.0.12.0.12-8-standard` | `jdk21-dragonwell` | `21.0.12.0.12` |
-| `uos-20-1070a-temurin-25.0.5-8` | `jdk25-adoptium` | `25.0.5` |
-| `kylin-v11-2503-temurin-25.0.5-8` | `jdk25-adoptium-kylin` | `25.0.5` |
-| `uos-20-1070a-dragonwell-25.0.4.0.4-7-standard` | `jdk25-dragonwell` | `25.0.4.0.4` |
-| `uos-20-1070a-dragonwell-25.0.4.0.4-7-extended` | `jdk25-dragonwell-extended` | `25.0.4.0.4` |
-| `uos-20-1070a-openjdk-1.8.0.422.b05-0.up2.uelc20.01` | `jdk8` | `1.8.0_422` |
-| `uos-20-1070a-dragonwell-8.30.29-extended` | `jdk8-dragonwell` | `1.8.0_502` |
+| 镜像 tag | 镜像内 `java -version` |
+|---|---|
+| `uos-20-1070a-openjdk-1.8.0.422.b05-0.up2.uelc20.01` | `1.8.0_422` |
+| `uos-20-1070a-dragonwell-8.30.29-extended` | `1.8.0_502` |
+| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2.uelc20.01` | `17.0.9` |
+| `uos-20-1070a-dragonwell-17.0.20.0.21-8-standard` | `17.0.20` |
+| `uos-20-1070a-openjdk-17.0.9.0.9-2.0.2.uelc20.01-ffmpeg` | `17.0.9` |
+| `uos-20-1070a-dragonwell-21.0.12.0.12-8-standard` | `21.0.12.0.12` |
+| `uos-20-1070a-dragonwell-25.0.4.0.4-7-standard` | `25.0.4.0.4` |
+| `uos-20-1070a-dragonwell-25.0.4.0.4-7-extended` | `25.0.4.0.4` |
+| `uos-20-1070a-temurin-25.0.5-8` | `25.0.5` |
+| `kylin-v11-2503-temurin-25.0.5-8` | `25.0.5` |
 <!-- VERSIONS:END -->
 
 > 这张表由构建工作流在补打完规范 tag 后自动重写，值取自镜像里实际装上的 JDK。
@@ -76,8 +83,8 @@
 > 功能层面的验证结果（编译运行、MaxRAMPercentage、entrypoint 链路等）见
 > Actions 里 `镜像功能与版本验证` 的 job summary。
 
-每次构建会推：历史 tag、`<历史 tag>-<短 sha>`，以及构建后补上的规范 tag。
-历史 tag 保留是为了让已引用旧 tag 的使用方仍能拿到更新，后续可择机下线。
+每次构建只推这一个 tag。旧的 `jdk8`、`jdk17-dragonwell` 等短名已下线，
+需要的话按上表的完整 tag 引用。
 
 ---
 
@@ -151,9 +158,9 @@ docker buildx build --platform linux/amd64 -f jdk17/Dockerfile -t my/jdk17:amd64
 | `JDKVER_RAW` | `25.0.5+8` | Temurin 版本，仅 adoptium 变体（**自动跟踪**） |
 
 OpenJDK 变体（`jdk8` / `jdk17` / `jdk17-ffmpeg`）的 JDK 版本**不在 Dockerfile 里写死**，
-直接 `yum install java-*-openjdk-devel` 装 UOS 仓库当前版本。构建完成后从镜像里
-`rpm -q --qf '%{VERSION}-%{RELEASE}'` 读出实际装上的 NEVRA，再用
-`docker buildx imagetools create` 补打规范 tag——这样 tag 永远等于镜像里真实存在的版本，
+直接 `yum install java-*-openjdk-devel` 装 UOS 仓库当前版本。构建前会先进基础镜像
+`yum list available` 查出当前版本用来拼 tag，装完再用 `rpm -q --qf '%{VERSION}-%{RELEASE}'`
+复核镜像里的 NEVRA，两者不符直接失败——这样 tag 永远等于镜像里真实存在的版本，
 仓库升级 JDK 后下次构建 tag 自动跟着变，不需要改任何文件。
 
 Dragonwell / Temurin 是自己下载的，版本由 ARG 决定，构建前就能算出 tag。
@@ -222,7 +229,7 @@ MIRROR_GITHUB=https://ghproxy.example.com/https://github.com ./build.sh jdk17
 | 触发 | 行为 |
 |---|---|
 | `workflow_run`（构建工作流完成后） | 自动全量验证 10 变体 × 2 架构 |
-| `workflow_dispatch` | 手动跑，`variant` 可填历史 tag 或规范 tag 只验证一个，`platforms` 可只选单架构 |
+| `workflow_dispatch` | 手动跑，`variant` 可填完整 tag 只验证一个，`platforms` 可只选单架构 |
 | schedule（每日 UTC 04:00 / 北京 12:00） | 巡检，防止镜像被覆盖或上游漂移 |
 
 ### 检查项
@@ -238,8 +245,8 @@ MIRROR_GITHUB=https://ghproxy.example.com/https://github.com ./build.sh jdk17
 | 环境 | 时区 `Asia/Shanghai`、中文 locale |
 | 特性 | `ffmpeg` 变体额外检查 `ffmpeg -version` |
 
-另有一个 `tag-check` job，用 registry API 逐变体比对规范 tag 与历史 tag 的 manifest digest，
-确认补打的 tag 确实指向同一份镜像。
+另有一个 `tag-check` job，用 registry API 校验 registry 上只有这 10 个 tag（多一个都报错），
+且每个 tag 的 manifest 只含 `linux/amd64` + `linux/arm64`，没有 attestation 残留。
 
 > 镜像里不写 JDK 版本的 label。版本只作为 tag 的一部分用来区分镜像，
 > 需要看实际版本时以容器内 `java -version` 或 tag 为准。
