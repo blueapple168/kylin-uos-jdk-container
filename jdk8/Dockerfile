@@ -22,11 +22,6 @@ ARG MIRROR_GITHUB=""
 
 ARG OS_VERSION=20-1070a
 
-# UOS 仓库里 java-1.8.0-openjdk-devel 的 <version>-<release>。
-# 必须锁死：镜像 tag 承诺了这个版本，装到别的版本就等于 tag 撒谎。
-# 仓库清理旧版时构建会直接失败，这是正确信号 —— 改这里再重建即可。
-ARG OPENJDK_VER="1.8.0.412.b08-5.up2"
-
 LABEL org.opencontainers.image.authors="blueapple1120@qq.com" \
       org.opencontainers.image.version="1.0" \
       org.opencontainers.image.base.name="${BASE_IMAGE_REPO}/${BASE_IMAGE_TAG}" \
@@ -35,7 +30,7 @@ LABEL org.opencontainers.image.authors="blueapple1120@qq.com" \
       os.version="${OS_VERSION}" \
       os.arch="amd64,arm64" \
       jdk.vendor="openjdk" \
-      jdk.version="${OPENJDK_VER}" \
+      jdk.version="repo" \
       component="base-image"
 
 ARG BIN_DIR=/usr/local/bin
@@ -58,17 +53,13 @@ RUN set -euxo pipefail; \
     sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
     \
     # ---- 2. 安装软件包 ----
+    # 不锁 JDK 版本：版本由 UOS 仓库决定，构建后从镜像里读出实际版本再补打规范 tag
     yum makecache; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        "java-1.8.0-openjdk-devel-${OPENJDK_VER}" \
+        java-1.8.0-openjdk-devel \
         copy-jdk-configs \
         tar \
         curl; \
-    # 锁定版本后必须复核实际装上的 NEVRA，避免仓库静默替换成别的 build
-    ACTUAL_JDK="$(rpm -q --qf '%{VERSION}-%{RELEASE}' java-1.8.0-openjdk-devel)"; \
-    if [ "$ACTUAL_JDK" != "$OPENJDK_VER" ]; then \
-        echo "ERROR: JDK 版本不符, 期望 ${OPENJDK_VER}, 实际 ${ACTUAL_JDK}" >&2; exit 1; \
-    fi; \
     \
     # ---- 3. 安装 dumb-init + gosu ----
     mkdir -p /tmp/chk "${BIN_DIR}" "${OTEL_HOME}" /app; \

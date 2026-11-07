@@ -11,8 +11,9 @@
 #   8 发行版        openjdk / dragonwell / temurin
 #   9 特性          空 / ffmpeg（仅用于区分同系统同 JDK 的功能变体）
 #
-# 规范 tag 由 make_tag 拼成「系统-系统版本-发行版-JDK版本[-特性]」，JDK 版本从
-# Dockerfile 的 ARG（OPENJDK_VER / DRAGONWELL_RAW / JDKVER_RAW）读取，不在此处写死。
+# 规范 tag 由 make_tag 拼成「系统-系统版本-发行版-JDK版本[-特性]」：
+#   Dragonwell / Temurin 的版本从 Dockerfile 的 ARG（DRAGONWELL_RAW / JDKVER_RAW）读；
+#   OpenJDK 的版本由 UOS 仓库决定，构建完从镜像读实际 NEVRA 再补打 tag，不在此处写死。
 jdk8|Dockerfile|jdk8|openjdk||uos|20-1070a|openjdk|
 jdk8|Dockerfile-dragonwell-extended|jdk8-dragonwell|dragonwell|dragonwell:dragonwell8:extended|uos|20-1070a|dragonwell|extended
 jdk17|Dockerfile|jdk17|openjdk||uos|20-1070a|openjdk|

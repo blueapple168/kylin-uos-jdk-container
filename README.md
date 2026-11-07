@@ -49,8 +49,8 @@
 
 规范格式：`{系统}-{系统版本}-{发行版}-{JDK版本}[-{特性}]`
 
-- JDK 版本取自 Dockerfile 的 ARG（`OPENJDK_VER` / `DRAGONWELL_RAW` / `JDKVER_RAW`），
-  **tag 承诺什么版本，镜像里就是什么版本**
+- Dragonwell / Temurin 的版本取自 Dockerfile 的 ARG（`DRAGONWELL_RAW` / `JDKVER_RAW`），构建前即可算出 tag
+- OpenJDK 变体的版本由 UOS 仓库决定，构建后从镜像读实际 NEVRA 再补打 tag，**tag 承诺什么版本，镜像里就是什么版本**
 - Docker tag 不允许 `+`，一律替换为 `-`（如 `25.0.5+8` → `25.0.5-8`）
 - `-{特性}` 仅用于区分同系统同 JDK 的功能变体（如 `-ffmpeg`）
 - 变体清单集中维护在 `.github/variants.txt`，构建与验证两个工作流共用
@@ -68,7 +68,9 @@
 | `uos-20-1070a-temurin-25.0.5-8` | `jdk25-adoptium` |
 | `kylin-v11-2503-temurin-25.0.5-8` | `jdk25-adoptium-kylin` |
 
-每次构建会同时推三个 tag：规范 tag、历史 tag、`<历史 tag>-<短 sha>`。
+> 表中 OpenJDK 两行是当前 UOS 仓库的版本，实际值以构建日志里 `==> 镜像内实际 JDK 版本` 为准。
+
+每次构建会推：历史 tag、`<历史 tag>-<短 sha>`，以及构建后补上的规范 tag。
 历史 tag 保留是为了让已引用旧 tag 的使用方仍能拿到更新，后续可择机下线。
 
 ---
@@ -141,11 +143,14 @@ docker buildx build --platform linux/amd64 -f jdk17/Dockerfile -t my/jdk17:amd64
 | `MIRROR_GITHUB` | 空 | GitHub 镜像代理前缀，内网构建时填写 |
 | `DRAGONWELL_RAW` | 各文件内定义 | Dragonwell 版本，写法 `<版本号>+<build号>`（**自动跟踪**） |
 | `JDKVER_RAW` | `25.0.5+8` | Temurin 版本，仅 adoptium 变体（**自动跟踪**） |
-| `OPENJDK_VER` | 各文件内定义 | UOS 仓库 `java-*-openjdk-devel` 的 `<version>-<release>`（**锁死，不自动跟踪**） |
 
-`OPENJDK_VER` 必须锁死：镜像 tag 里承诺了这个版本，装到别的 build 就等于 tag 撒谎。
-构建期会用 `rpm -q --qf '%{VERSION}-%{RELEASE}'` 复核实际装上的 NEVRA，不符直接失败。
-UOS 仓库清理旧版时构建会报错，这是正确信号——改 ARG 再重建即可。
+OpenJDK 变体（`jdk8` / `jdk17` / `jdk17-ffmpeg`）的 JDK 版本**不在 Dockerfile 里写死**，
+直接 `yum install java-*-openjdk-devel` 装 UOS 仓库当前版本。构建完成后从镜像里
+`rpm -q --qf '%{VERSION}-%{RELEASE}'` 读出实际装上的 NEVRA，再用
+`docker buildx imagetools create` 补打规范 tag——这样 tag 永远等于镜像里真实存在的版本，
+仓库升级 JDK 后下次构建 tag 自动跟着变，不需要改任何文件。
+
+Dragonwell / Temurin 是自己下载的，版本由 ARG 决定，构建前就能算出 tag。
 
 三者均从 GitHub 官方 release 下载并做 sha256 校验：
 

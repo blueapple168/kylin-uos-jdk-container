@@ -126,14 +126,17 @@ jobs:
           }
 
           # 按「系统-系统版本-发行版-JDK版本[-特性]」拼新 tag。
-          # JDK 版本一律从 Dockerfile 的 ARG 读，保证 tag 承诺的内容与实际构建一致
-          # （upstream 模式改写 ARG 后，tag 自动跟随，不需要两处同时改）。
+          # Dragonwell / Temurin 是自己下载的，版本由 Dockerfile 的 ARG 决定，构建前就能算出 tag。
+          # OpenJDK 变体的版本由 UOS 仓库决定，构建前不知道，这里返回空，
+          # 由 build-push job 构建完从镜像里读出实际版本再补打规范 tag。
           # Docker tag 不允许 +，统一换成 -。
           make_tag() {
             local dir="$1" df="$2" v_os="$3" v_osver="$4" v_vendor="$5" v_flavor="$6"
             local jdkver=""
             case "$v_vendor" in
-              openjdk)    jdkver="$(get_arg "${dir}/${df}" OPENJDK_VER)" ;;
+              openjdk)
+                # 留空 = 待构建后确定
+                return 0 ;;
               dragonwell) jdkver="$(get_arg "${dir}/${df}" DRAGONWELL_RAW)" ;;
               temurin)    jdkver="$(get_arg "${dir}/${df}" JDKVER_RAW)" ;;
               *) echo "::error::${dir}/${df}: 未知发行版 ${v_vendor}" >&2; return 1 ;;
@@ -476,7 +479,7 @@ jobs:
 
   # 构建并推送双架构 manifest
   build-push:
-    name: "推送镜像 (${{ matrix.tag_new }})"
+    name: "推送镜像 (${{ matrix.tag }})"
     needs: [detect]
     # PR 只跑 detect；矩阵为空时不能进入（空 include 会被判定为无构建向量）
     if: >-
@@ -517,25 +520,21 @@ jobs:
         id: meta
         run: |
           set -eux
-          # 规范 tag：系统-系统版本-发行版-JDK版本[-特性]
-          TAG_NEW="${{ matrix.tag_new }}"
-          # 历史 tag，保留为别名，避免已引用旧 tag 的使用方拉不到更新
+          # 历史 tag：构建时先推这个，OpenJDK 变体要靠它读实际版本
           TAG_OLD="${{ matrix.tag }}"
-          test -n "$TAG_NEW"
           test -n "$TAG_OLD"
+          # 规范 tag：Dragonwell/Temurin 构建前已确定；OpenJDK 为空，构建后补
+          TAG_NEW="${{ matrix.tag_new }}"
           REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           IMAGE="${REGISTRY}/${REPO}"
           {
             echo "image=${IMAGE}"
-            echo "tags=${IMAGE}:${TAG_NEW},${IMAGE}:${TAG_OLD},${IMAGE}:${TAG_OLD}-${GITHUB_SHA::7}"
-            # cache scope 用规范 tag，旧 tag 变更（重命名变体）不会打散缓存
-            echo "scope=${TAG_NEW}"
+            echo "tag_old=${TAG_OLD}"
+            echo "tag_new=${TAG_NEW}"
+            echo "tags=${IMAGE}:${TAG_OLD},${IMAGE}:${TAG_OLD}-${GITHUB_SHA::7}"
+            # cache scope 用变体短名，与 tag 命名规则解耦
+            echo "scope=${{ matrix.variant }}"
           } >> "$GITHUB_OUTPUT"
-          {
-            echo "| 规范 tag | 历史 tag |"
-            echo "|---|---|"
-            echo "| \`${TAG_NEW}\` | \`${TAG_OLD}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 构建并推送 (amd64 + arm64 合并 manifest)
         uses: docker/build-push-action@v6
@@ -556,14 +555,52 @@ jobs:
           cache-from: type=gha,scope=jdk-${{ steps.meta.outputs.scope }}
           cache-to: type=gha,scope=jdk-${{ steps.meta.outputs.scope }},mode=max
 
+      - name: 补打规范 tag (系统-系统版本-发行版-JDK版本)
+        id: retag
+        run: |
+          set -eux
+          IMAGE="${{ steps.meta.outputs.image }}"
+          TAG_OLD="${{ steps.meta.outputs.tag_old }}"
+          TAG_NEW="${{ steps.meta.outputs.tag_new }}"
+
+          if [ -z "$TAG_NEW" ]; then
+            # OpenJDK 变体：版本由 UOS 仓库决定，从构建产物里读实际装上的 NEVRA。
+            # 用 --entrypoint sh 跳过 dumb-init/entrypoint，避免走到应用启动逻辑。
+            docker pull --platform linux/amd64 "${IMAGE}:${TAG_OLD}"
+            JDKVER="$(docker run --rm --platform linux/amd64 --entrypoint sh "${IMAGE}:${TAG_OLD}" \
+              -c 'PKG="$(rpm -qa | grep -- -openjdk-devel | head -1)"; rpm -q --qf "%{VERSION}-%{RELEASE}" "$PKG"')"
+            JDKVER="$(printf '%s' "$JDKVER" | tr -d '\r\n')"
+            if [ -z "$JDKVER" ]; then
+              echo "::error::未能从镜像读出 openjdk-devel 版本，无法生成规范 tag" >&2
+              exit 1
+            fi
+            echo "==> 镜像内实际 JDK 版本: ${JDKVER}"
+            TAG_NEW="${{ matrix.os }}-${{ matrix.osver }}-${{ matrix.vendor }}-${JDKVER}"
+            FLAVOR="${{ matrix.flavor }}"
+            if [ -n "$FLAVOR" ]; then
+              TAG_NEW="${TAG_NEW}-${FLAVOR}"
+            fi
+          else
+            echo "==> 规范 tag 由 Dockerfile ARG 决定: ${TAG_NEW}"
+          fi
+
+          # imagetools create 只给已有 manifest 加 tag，不重建、不重复推层
+          docker buildx imagetools create -t "${IMAGE}:${TAG_NEW}" "${IMAGE}:${TAG_OLD}"
+          echo "tag_new=${TAG_NEW}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 已推送 (${{ matrix.variant }})"
+            echo ""
+            echo "| 规范 tag | 历史 tag |"
+            echo "|---|---|"
+            echo "| \`${TAG_NEW}\` | \`${TAG_OLD}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 校验 manifest 包含两个架构
         run: |
           set -eux
-          docker buildx imagetools inspect \
-            "${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]'):${{ matrix.tag }}"
-          {
-            echo "### 已推送镜像 (${{ matrix.variant }})"
-            echo '```'
-            echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          IMAGE="${{ steps.meta.outputs.image }}"
+          for t in "${{ steps.retag.outputs.tag_new }}" "${{ steps.meta.outputs.tag_old }}"; do
+            echo "--- ${t} ---"
+            docker buildx imagetools inspect "${IMAGE}:${t}"
+          done

@@ -22,9 +22,6 @@ ARG MIRROR_GITHUB=""
 
 ARG OS_VERSION=20-1070a
 
-# UOS 仓库里 java-17-openjdk-devel 的 <version>-<release>。锁死原因见 jdk8/Dockerfile
-ARG OPENJDK_VER="17.0.9.0.9-2.0.2"
-
 LABEL org.opencontainers.image.authors="blueapple1120@qq.com" \
       org.opencontainers.image.version="1.0" \
       org.opencontainers.image.base.name="${BASE_IMAGE_REPO}/${BASE_IMAGE_TAG}" \
@@ -33,7 +30,7 @@ LABEL org.opencontainers.image.authors="blueapple1120@qq.com" \
       os.version="${OS_VERSION}" \
       os.arch="amd64,arm64" \
       jdk.vendor="openjdk" \
-      jdk.version="${OPENJDK_VER}" \
+      jdk.version="repo" \
       component="base-image"
 
 ARG BIN_DIR=/usr/local/bin
@@ -56,19 +53,15 @@ RUN set -euxo pipefail; \
     sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
     \
     # ---- 2. 安装软件包 ----
+    # 不锁 JDK 版本：版本由 UOS 仓库决定，构建后从镜像里读出实际版本再补打规范 tag
     yum makecache; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        "java-17-openjdk-devel-${OPENJDK_VER}" \
+        java-17-openjdk-devel \
         copy-jdk-configs \
         yasm \
         ffmpeg \
         tar \
         curl; \
-    # 锁定版本后必须复核实际装上的 NEVRA，避免仓库静默替换成别的 build
-    ACTUAL_JDK="$(rpm -q --qf '%{VERSION}-%{RELEASE}' java-17-openjdk-devel)"; \
-    if [ "$ACTUAL_JDK" != "$OPENJDK_VER" ]; then \
-        echo "ERROR: JDK 版本不符, 期望 ${OPENJDK_VER}, 实际 ${ACTUAL_JDK}" >&2; exit 1; \
-    fi; \
     \
     # ---- 3. 安装 dumb-init + gosu ----
     mkdir -p /tmp/chk "${BIN_DIR}" "${OTEL_HOME}" /app; \

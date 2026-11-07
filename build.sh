@@ -54,11 +54,12 @@ get_arg() {
 }
 
 # 按「系统-系统版本-发行版-JDK版本[-特性]」拼规范 tag。Docker tag 不允许 +，换成 -
+# OpenJDK 变体返回空：版本由 UOS 仓库决定，只能构建完从镜像里读，见 build_one
 make_tag() {
     local dir="$1" df="$2" os="$3" osver="$4" vendor="$5" flavor="$6"
     local jdkver=""
     case "${vendor}" in
-        openjdk)    jdkver="$(get_arg "${dir}/${df}" OPENJDK_VER)" ;;
+        openjdk)    return 0 ;;
         dragonwell) jdkver="$(get_arg "${dir}/${df}" DRAGONWELL_RAW)" ;;
         temurin)    jdkver="$(get_arg "${dir}/${df}" JDKVER_RAW)" ;;
         *) echo "unknown vendor: ${vendor}" >&2; return 1 ;;
@@ -85,8 +86,9 @@ pick_variants() {
 
 build_one() {
     local dir="$1" df="$2" suffix="$3" new_tag="$4"
-    local tag_new="${IMAGE_PREFIX}:${new_tag}"
     local tag_old="${IMAGE_PREFIX}:${suffix}"
+    local tag_new=""
+    [[ -n "${new_tag}" ]] && tag_new="${IMAGE_PREFIX}:${new_tag}"
 
     # --load 只能加载单个平台，剥离多平台列表
     local platforms="${PLATFORMS}"
@@ -95,13 +97,14 @@ build_one() {
     local cmd=(docker buildx build
         --file "${dir}/${df}"
         --platform "${platforms}"
-        --tag "${tag_new}"
         --tag "${tag_old}"
         --build-arg "DUMB_INIT_VER=${DUMB_INIT_VER:-1.2.5}"
         --build-arg "GOSU_VER=${GOSU_VER:-1.20}"
         --build-arg "OTEL_AGENT_VER=${OTEL_AGENT_VER:-2.33.1}"
         --label "org.opencontainers.image.revision=jdk-${suffix}"
     )
+    # 规范 tag 已知就直接一起打上；OpenJDK 要等构建完读出版本再补
+    [[ -n "${tag_new}" ]] && cmd+=(--tag "${tag_new}")
 
     if [[ -n "${MIRROR_GITHUB:-}" ]]; then
         cmd+=(--build-arg "MIRROR_GITHUB=${MIRROR_GITHUB}")
@@ -120,17 +123,46 @@ build_one() {
     fi
 
     if [[ "${IMAGE_TAG}" != "latest" ]]; then
-        cmd+=(--tag "${IMAGE_PREFIX}:${new_tag}-${IMAGE_TAG}")
+        cmd+=(--tag "${IMAGE_PREFIX}:${suffix}-${IMAGE_TAG}")
     fi
 
     cmd+=("${dir}")
 
     echo "------------------------------------------------------------"
     echo ">>> ${suffix}  (${dir}/${df})"
-    echo ">>> 规范 tag: ${new_tag}"
+    echo ">>> 规范 tag: ${new_tag:-构建后按仓库实际版本确定}"
     echo ">>> platforms: ${platforms}"
     echo "------------------------------------------------------------"
     "${cmd[@]}"
+
+    # OpenJDK 变体：版本由 UOS 仓库决定，构建完从镜像里读出实际 NEVRA 再补打规范 tag
+    if [[ -z "${new_tag}" ]]; then
+        local probe=""
+        if [[ "${LOAD}" == "1" || "${NO_PUSH}" == "1" ]]; then
+            probe="${tag_old}"
+        else
+            docker pull -q --platform "${platforms%%,*}" "${tag_old}"
+            probe="${tag_old}"
+        fi
+        local jv
+        jv="$(docker run --rm --platform "${platforms%%,*}" --entrypoint sh "${probe}" \
+            -c 'PKG="$(rpm -qa | grep -- -openjdk-devel | head -1)"; rpm -q --qf "%{VERSION}-%{RELEASE}" "$PKG"' | tr -d '\r\n')"
+        if [[ -n "${jv}" ]]; then
+            local v_os v_osver v_vendor v_flavor
+            IFS='|' read -r _ _ _ _ v_os v_osver v_vendor v_flavor <<< "$(printf '%s\n' "${ALL_VARIANTS[@]}" | grep -F "|${suffix}|" | head -n1)"
+            new_tag="${v_os}-${v_osver}-${v_vendor}-${jv}"
+            [[ -n "${v_flavor}" ]] && new_tag="${new_tag}-${v_flavor}"
+            echo ">>> 镜像内实际 JDK 版本: ${jv}"
+            echo ">>> 规范 tag: ${new_tag}"
+            if [[ "${PUSH}" == "1" && "${NO_PUSH}" == "0" ]]; then
+                docker buildx imagetools create -t "${IMAGE_PREFIX}:${new_tag}" "${tag_old}"
+            else
+                docker tag "${tag_old}" "${IMAGE_PREFIX}:${new_tag}"
+            fi
+        else
+            echo ">>> 警告: 读不到 JDK 版本，跳过规范 tag" >&2
+        fi
+    fi
 }
 
 mapfile -t VARIANTS < <(pick_variants "${ARGS[0]:-}" "${ARGS[1]:-}")
@@ -150,5 +182,9 @@ echo "完成。查看 manifest："
 for v in "${VARIANTS[@]}"; do
     IFS='|' read -r dir df suffix short v_os v_osver v_vendor v_flavor <<< "${v}"
     new_tag="$(make_tag "${dir}" "${df}" "${v_os}" "${v_osver}" "${v_vendor}" "${v_flavor}")"
-    echo "  docker buildx imagetools inspect ${IMAGE_PREFIX}:${new_tag}"
+    if [[ -n "${new_tag}" ]]; then
+        echo "  docker buildx imagetools inspect ${IMAGE_PREFIX}:${new_tag}"
+    else
+        echo "  ${suffix}: 规范 tag 已按构建时的仓库版本补打，见上方输出"
+    fi
 done

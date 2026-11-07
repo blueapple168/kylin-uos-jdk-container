@@ -74,11 +74,15 @@ jobs:
             local dir="$1" df="$2" v_os="$3" v_osver="$4" v_vendor="$5" v_flavor="$6"
             local jdkver=""
             case "$v_vendor" in
-              openjdk)    jdkver="$(get_arg "${dir}/${df}" OPENJDK_VER)" ;;
+              # OpenJDK 版本由 UOS 仓库决定，构建后才确定，这里留空
+              openjdk)    jdkver="" ;;
               dragonwell) jdkver="$(get_arg "${dir}/${df}" DRAGONWELL_RAW)" ;;
               temurin)    jdkver="$(get_arg "${dir}/${df}" JDKVER_RAW)" ;;
             esac
-            [ -n "$jdkver" ] || { echo "::error::${dir}/${df}: 解析不到 JDK 版本" >&2; return 1; }
+            if [ -z "$jdkver" ] && [ "$v_vendor" != "openjdk" ]; then
+              echo "::error::${dir}/${df}: 解析不到 JDK 版本" >&2
+              return 1
+            fi
             jdkver="${jdkver//+/-}"
             local t="${v_os}-${v_osver}-${v_vendor}-${jdkver}"
             [ -n "$v_flavor" ] && t="${t}-${v_flavor}"
@@ -86,10 +90,11 @@ jobs:
           }
 
           # 期望 JDK 版本要原样传给容器内脚本（保留 +，脚本自己判主版本）
+          # OpenJDK 留空：脚本内改读 rpm 实际版本，tag 一致性由 tag-check job 校验
           jdk_raw() {
             local dir="$1" df="$2" vendor="$3"
             case "$vendor" in
-              openjdk)    get_arg "${dir}/${df}" OPENJDK_VER ;;
+              openjdk)    printf '' ;;
               dragonwell) get_arg "${dir}/${df}" DRAGONWELL_RAW ;;
               temurin)    get_arg "${dir}/${df}" JDKVER_RAW ;;
             esac
@@ -99,10 +104,9 @@ jobs:
           while IFS='|' read -r dir df tag_old short dwsrc v_os v_osver v_vendor v_flavor; do
             [ -n "$dir" ] || continue
             [ -f "${dir}/${df}" ] || { echo "::warning::跳过不存在的 ${dir}/${df}"; continue; }
-            tag_new="$(make_tag "$dir" "$df" "$v_os" "$v_osver" "$v_vendor" "$v_flavor")"
-
-            # 手工指定变体时，历史 tag 或规范 tag 任一命中即保留
-            if [ -n "$WANT" ] && [ "$WANT" != "$tag_old" ] && [ "$WANT" != "$tag_new" ]; then
+            # 规范 tag 可能还没补上（OpenJDK 要构建后才知道版本），所以验证统一用历史 tag 拉镜像，
+            # 它一定存在且指向最新构建产物
+            if [ -n "$WANT" ] && [ "$WANT" != "$tag_old" ]; then
               continue
             fi
 
@@ -111,7 +115,7 @@ jobs:
             echo "$PLATS" | tr ',' '\n' | while read -r plat; do
               [ -n "$plat" ] || continue
               arch="${plat##*/}"
-              printf '%s\n' "{\"tag\":\"${tag_new}\",\"tag_old\":\"${tag_old}\",\"arch\":\"${arch}\",\"platform\":\"${plat}\",\"os\":\"${v_os}\",\"osver\":\"${v_osver}\",\"vendor\":\"${v_vendor}\",\"jdkver\":\"${jdk_ver}\",\"flavor\":\"${v_flavor}\"}"
+              printf '%s\n' "{\"tag\":\"${tag_old}\",\"arch\":\"${arch}\",\"platform\":\"${plat}\",\"os\":\"${v_os}\",\"osver\":\"${v_osver}\",\"vendor\":\"${v_vendor}\",\"jdkver\":\"${jdk_ver}\",\"flavor\":\"${v_flavor}\"}"
             done >> /tmp/rows.txt
           done < <(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt)
 
@@ -126,9 +130,9 @@ jobs:
           {
             echo "### 本次验证的镜像"
             echo ""
-            echo "| 规范 tag | 历史 tag | 架构 |"
-            echo "|---|---|---|"
-            printf '%s\n' "$matrix" | jq -r '.[] | "| `\(.tag)` | `\(.tag_old)` | \(.arch) |"' 2>/dev/null || true
+            echo "| 镜像 tag | 架构 | 发行版 | 期望 JDK |"
+            echo "|---|---|---|---|"
+            printf '%s\n' "$matrix" | jq -r '.[] | "| `\(.tag)` | \(.arch) | \(.vendor) | \(.jdkver // "由仓库决定") |"' 2>/dev/null || true
           } >> "$GITHUB_STEP_SUMMARY" || true
 
   verify:
@@ -196,7 +200,13 @@ jobs:
             chk os          "${{ matrix.os }}"
             chk os.version  "${{ matrix.osver }}"
             chk jdk.vendor  "${{ matrix.vendor }}"
-            chk jdk.version "${{ matrix.jdkver }}"
+            # OpenJDK 变体的版本由 UOS 仓库决定，label 写的是 repo 占位，
+            # 真实版本由 tag-check job 与规范 tag 比对
+            if [ "${{ matrix.vendor }}" != "openjdk" ]; then
+              chk jdk.version "${{ matrix.jdkver }}"
+            else
+              printf 'INFO\tlabel jdk.version\trepo（由仓库决定，见 tag-check）\n'
+            fi
             printf 'SUMMARY\tFAIL\t%s\n' "${fails}"
           } | tee /tmp/labels.tsv
 
@@ -259,11 +269,10 @@ jobs:
               rows.append({"status": "FAIL", "item": "整体", "detail": "镜像拉取失败，未产生任何检查结果"})
           print(json.dumps({
               "tag": "${{ matrix.tag }}",
-              "tag_old": "${{ matrix.tag_old }}",
               "arch": "${{ matrix.arch }}",
               "platform": "${{ matrix.platform }}",
               "vendor": "${{ matrix.vendor }}",
-              "jdkver": "${{ matrix.jdkver }}",
+              "jdkver": "${{ matrix.jdkver }}" or "由仓库决定",
               "fails": fails,
               "checks": rows,
           }, ensure_ascii=False, indent=2))
@@ -278,9 +287,105 @@ jobs:
           path: out/*.json
           if-no-files-found: warn
 
+  tag-check:
+    name: 校验规范 tag 与镜像内容一致
+    needs: [plan]
+    if: >-
+      always() &&
+      needs.plan.outputs.matrix != '[]' &&
+      needs.plan.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 逐个变体比对
+        run: |
+          set -eux
+          REPO="$(echo '${{ github.repository }}' | tr 'A-Z' 'a-z')"
+          IMAGE="${REGISTRY}/${REPO}"
+          # 直接用 registry API 取 manifest digest，比 buildx inspect 的模板更稳
+          GHCR_TOKEN="$(curl -fsS "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" | jq -r .token)"
+          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json"
+          digest_of() {
+            curl -fsSI -H "Authorization: Bearer ${GHCR_TOKEN}" -H "Accept: ${ACCEPT}" \
+              "https://ghcr.io/v2/${REPO}/manifests/$1" \
+              | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'
+          }
+
+          fails=0
+          rows=""
+          while IFS='|' read -r dir df tag_old short dwsrc v_os v_osver v_vendor v_flavor; do
+            [ -n "$dir" ] || continue
+            [ -f "${dir}/${df}" ] || continue
+
+            # 期望的 JDK 版本：Dragonwell/Temurin 来自 Dockerfile ARG；
+            # OpenJDK 来自仓库，只能拉镜像进容器读实际装上的 NEVRA
+            case "$v_vendor" in
+              openjdk)
+                docker pull -q --platform linux/amd64 "${IMAGE}:${tag_old}"
+                jdkver="$(docker run --rm --platform linux/amd64 --entrypoint sh "${IMAGE}:${tag_old}" \
+                  -c 'PKG="$(rpm -qa | grep -- -openjdk-devel | head -1)"; rpm -q --qf "%{VERSION}-%{RELEASE}" "$PKG"')"
+                jdkver="$(printf '%s' "$jdkver" | tr -d '\r\n')"
+                ;;
+              dragonwell)
+                jdkver="$(sed -nE 's/^ARG[[:space:]]+DRAGONWELL_RAW=([^ #]+).*/\1/p' "${dir}/${df}" | head -n1 | tr -d '"')"
+                ;;
+              temurin)
+                jdkver="$(sed -nE 's/^ARG[[:space:]]+JDKVER_RAW=([^ #]+).*/\1/p' "${dir}/${df}" | head -n1 | tr -d '"')"
+                ;;
+            esac
+            jdkver="${jdkver//+/-}"
+            if [ -z "$jdkver" ]; then
+              echo "::error::${dir}/${df}: 取不到 JDK 版本，无法推导规范 tag"
+              fails=$((fails + 1))
+              continue
+            fi
+
+            expect="${v_os}-${v_osver}-${v_vendor}-${jdkver}"
+            [ -n "$v_flavor" ] && expect="${expect}-${v_flavor}"
+
+            d_new="$(digest_of "${expect}" || true)"
+            if [ -z "$d_new" ]; then
+              echo "::error::规范 tag 不存在: ${expect}（历史 tag ${tag_old}）"
+              fails=$((fails + 1))
+              rows="${rows}| \`${tag_old}\` | \`${expect}\` | ❌ 不存在 |"$'\n'
+              continue
+            fi
+            d_old="$(digest_of "${tag_old}" || true)"
+            if [ "$d_new" = "$d_old" ]; then
+              echo "PASS ${tag_old} -> ${expect}  ${d_new:0:26}"
+              rows="${rows}| \`${tag_old}\` | \`${expect}\` | ✅ digest 一致 |"$'\n'
+            else
+              echo "::error::digest 不一致 ${tag_old}=${d_old:0:26} vs ${expect}=${d_new:0:26}"
+              fails=$((fails + 1))
+              rows="${rows}| \`${tag_old}\` | \`${expect}\` | ❌ digest 不一致 |"$'\n'
+            fi
+          done < <(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt)
+
+          {
+            echo "### 规范 tag 一致性"
+            echo ""
+            echo "| 历史 tag | 规范 tag | 结果 |"
+            echo "|---|---|---|"
+            printf '%s' "$rows"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$fails" -gt 0 ]; then
+            echo "::error::${fails} 个变体的规范 tag 与镜像不一致"
+            exit 1
+          fi
+
   report:
     name: 生成验证报告
-    needs: [plan, verify]
+    needs: [plan, verify, tag-check]
     if: always() && needs.plan.outputs.matrix != '[]' && needs.plan.outputs.matrix != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10

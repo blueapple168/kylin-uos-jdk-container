@@ -21,6 +21,16 @@ ng()   { printf 'FAIL\t%s\t%s\n' "$1" "$2"; fails=$((fails + 1)); }
 wn()   { printf 'WARN\t%s\t%s\n' "$1" "$2"; }
 inf()  { printf 'INFO\t%s\t%s\n' "$1" "$2"; }
 
+# OpenJDK 变体的 JDK 版本由 UOS 仓库决定，调用方传空；这里改读镜像内 rpm 的实际 NEVRA，
+# 后面用它推主版本、与 java -version 交叉验证。Dragonwell/Temurin 由调用方传入。
+if [ -z "$EXP_JDKVER" ]; then
+    PKG="$(rpm -qa 2>/dev/null | grep -- -openjdk-devel | head -n1 || true)"
+    if [ -n "$PKG" ]; then
+        EXP_JDKVER="$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$PKG" 2>/dev/null | tr -d '\r\n')"
+        inf "仓库 JDK 版本" "${EXP_JDKVER}"
+    fi
+fi
+
 # 期望主版本：1.8.0.412.b08-5.up2 -> 1.8；25.0.5+8 -> 25；Dragonwell 8.30.29 -> 1.8
 case "$EXP_JDKVER" in
     1.*)   EXP_MAJOR="1.8" ;;
