@@ -229,7 +229,6 @@ MIRROR_GITHUB=https://ghproxy.example.com/https://github.com ./build.sh jdk17
 
 | 类别 | 项目 |
 |---|---|
-| 镜像 label | `os`、`os.version`、`jdk.vendor`、`jdk.version` 与预期一致 |
 | 系统 | `/etc/os-release` 的 ID 与 PRETTY_NAME、`uname -m` 架构 |
 | JDK | `java -version` / `javac -version` 主版本、`java.vendor` 发行商、`JAVA_HOME` 与 `java.home` 一致性 |
 | 功能 | 现场写 `Hello.java` → `javac` 编译 → `java` 运行，输出校验；JDK 9+ 的模块数 |
@@ -238,6 +237,12 @@ MIRROR_GITHUB=https://ghproxy.example.com/https://github.com ./build.sh jdk17
 | 链路 | 默认 entrypoint 跑 `id`，输出 `uid=1000(app)` 说明 dumb-init → entrypoint → gosu 全通 |
 | 环境 | 时区 `Asia/Shanghai`、中文 locale |
 | 特性 | `ffmpeg` 变体额外检查 `ffmpeg -version` |
+
+另有一个 `tag-check` job，用 registry API 逐变体比对规范 tag 与历史 tag 的 manifest digest，
+确认补打的 tag 确实指向同一份镜像。
+
+> 镜像里不写 JDK 版本的 label。版本只作为 tag 的一部分用来区分镜像，
+> 需要看实际版本时以容器内 `java -version` 或 tag 为准。
 
 检查脚本在 `.github/scripts/verify-image.sh`，只用 POSIX sh + coreutils
 （Kylin minimal 没有 bash，写 bash 专有语法会直接跑不起来）。

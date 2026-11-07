@@ -26,11 +26,9 @@ LABEL org.opencontainers.image.authors="blueapple1120@qq.com" \
       org.opencontainers.image.version="1.0" \
       org.opencontainers.image.base.name="${BASE_IMAGE_REPO}/${BASE_IMAGE_TAG}" \
       org.opencontainers.image.description="UOS ${OS_VERSION} JDK 1.8 (OpenJDK) Optimized Base Image (multi-arch: amd64/arm64)" \
-      os="uos" \
+      os="UOS" \
       os.version="${OS_VERSION}" \
       os.arch="amd64,arm64" \
-      jdk.vendor="openjdk" \
-      jdk.version="repo" \
       component="base-image"
 
 ARG BIN_DIR=/usr/local/bin

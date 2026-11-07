@@ -175,8 +175,8 @@ jobs:
             echo "::warning::镜像不存在或拉取失败: ${IMAGE} (${{ matrix.platform }})，跳过验证"
           fi
 
-      # label 校验不在这里做：arm64 下 docker pull 后 inspect 常拿到空 Config，
-      # 改用 registry API 读该架构的 config blob，放在 tag-check job 里统一校验。
+      # 这里只做「镜像能不能跑」的容器内检查。
+      # 镜像元数据（tag 与内容的对应关系）由 tag-check job 用 registry API 校验。
 
       - name: 容器内功能与版本自检
         id: selftest
@@ -219,7 +219,7 @@ jobs:
           python3 - <<'PY' > "out/${{ matrix.arch }}-${{ matrix.tag }}.json"
           import json, os, glob
           rows, fails = [], 0
-          for f in ("/tmp/labels.tsv", "/tmp/selftest.tsv", "/tmp/entrypoint.tsv"):
+          for f in ("/tmp/selftest.tsv", "/tmp/entrypoint.tsv"):
               if not os.path.exists(f):
                   continue
               for line in open(f, encoding="utf-8", errors="replace"):
@@ -292,49 +292,6 @@ jobs:
 
           fails=0
           rows=""
-          label_rows=""
-
-          # 直接读 registry 里该架构的 config blob 取 Labels。
-          # 不用 docker pull + inspect：arm64 下 inspect 常拿到空 Config，读不到 label。
-          config_labels() {   # $1=tag  $2=arch
-            local md cd
-            md="$(curl -fsSL -H "Authorization: Bearer ${GHCR_TOKEN}" -H "Accept: ${ACCEPT}" \
-                  "https://ghcr.io/v2/${REPO}/manifests/$1" \
-                  | jq -r --arg a "$2" '.manifests[]? | select(.platform.architecture==$a) | .digest' | head -n1)"
-            [ -n "$md" ] && [ "$md" != "null" ] || return 1
-            cd="$(curl -fsSL -H "Authorization: Bearer ${GHCR_TOKEN}" -H "Accept: ${ACCEPT}" \
-                  "https://ghcr.io/v2/${REPO}/manifests/${md}" | jq -r '.config.digest')"
-            [ -n "$cd" ] && [ "$cd" != "null" ] || return 1
-            curl -fsSL -H "Authorization: Bearer ${GHCR_TOKEN}" \
-              "https://ghcr.io/v2/${REPO}/blobs/${cd}" | jq -c '.config.Labels // {}'
-          }
-
-          check_labels() {   # $1=tag  $2=os  $3=osver  $4=vendor  $5=jdkver(可空)
-            local tag="$1" arch lb k want got pairs
-            for arch in amd64 arm64; do
-              if ! lb="$(config_labels "$tag" "$arch")"; then
-                echo "::error::${tag} ${arch}: 读不到 config blob"
-                fails=$((fails + 1))
-                label_rows="${label_rows}| \`${tag}\` | ${arch} | - | ❌ 读不到 config |"$'\n'
-                continue
-              fi
-              pairs="os=$2 os.version=$3 jdk.vendor=$4"
-              [ -n "$5" ] && pairs="${pairs} jdk.version=$5"
-              for kv in $pairs; do
-                k="${kv%%=*}"; want="${kv#*=}"
-                # label 里 JDK 版本保留原始的 +（25.0.5+8），tag 里必须换成 -（25.0.5-8），
-                # 比对前统一成 tag 形式，否则永远不等
-                got="$(printf '%s' "$lb" | jq -r --arg k "$k" '.[$k] // ""' | tr '+' '-')"
-                if [ "$got" = "$want" ]; then
-                  label_rows="${label_rows}| \`${tag}\` | ${arch} | ${k} | ✅ ${got} |"$'\n'
-                else
-                  echo "::error::${tag} ${arch}: label ${k} 期望 ${want}，实际 ${got:-空}"
-                  fails=$((fails + 1))
-                  label_rows="${label_rows}| \`${tag}\` | ${arch} | ${k} | ❌ 期望 ${want}，实际 ${got:-空} |"$'\n'
-                fi
-              done
-            done
-          }
 
           while IFS='|' read -r dir df tag_old short dwsrc v_os v_osver v_vendor v_flavor; do
             [ -n "$dir" ] || continue
@@ -382,13 +339,6 @@ jobs:
               fails=$((fails + 1))
               rows="${rows}| \`${tag_old}\` | \`${expect}\` | ❌ digest 不一致 |"$'\n'
             fi
-
-            # OpenJDK 的 jdk.version label 写的是 repo 占位，不参与比对
-            if [ "$v_vendor" = "openjdk" ]; then
-              check_labels "${expect}" "$v_os" "$v_osver" "$v_vendor" ""
-            else
-              check_labels "${expect}" "$v_os" "$v_osver" "$v_vendor" "${jdkver}"
-            fi
           done < <(grep -vE '^[[:space:]]*(#|$)' .github/variants.txt)
 
           {
@@ -397,12 +347,6 @@ jobs:
             echo "| 历史 tag | 规范 tag | 结果 |"
             echo "|---|---|---|"
             printf '%s' "$rows"
-            echo ""
-            echo "### 镜像 label 校验（读 registry config blob）"
-            echo ""
-            echo "| 规范 tag | 架构 | label | 结果 |"
-            echo "|---|---|---|---|"
-            printf '%s' "$label_rows"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$fails" -gt 0 ]; then
