@@ -24,7 +24,7 @@ ARG OS_VERSION=20-1070a
 
 # DRAGONWELL_RAW 写法 <版本号>+<build号>（无 build 号则只写版本，如 8.30.29）。
 # 下载链路由此推导：文件名把 + 换成 .，URL 路径把 + 转义为 %2B。
-ARG DRAGONWELL_RAW="21.0.12.0.12+8"
+ARG DRAGONWELL_RAW="21.0.13.0.13+9"
 
 LABEL org.opencontainers.image.authors="blueapple1120@qq.com" \
       org.opencontainers.image.version="1.0" \
